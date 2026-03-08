@@ -216,25 +216,39 @@ def _generate_rollout_completions_compat(trainer: Any, prompts: list[str]) -> li
     Works with trl<=0.24.0 which lacks the openenv experimental module.
     Returns the same format: list of dicts with prompt_ids, completion_ids, logprobs, text.
     """
+    import signal
     import torch
 
     tokenizer = trainer.processing_class
     model = trainer.model
+    gen_timeout = int(os.getenv("KERNELFORGE_GENERATION_TIMEOUT", "120"))
 
     results = []
-    for prompt in prompts:
+    for prompt_idx, prompt in enumerate(prompts):
         inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=4096)
         input_ids = inputs["input_ids"].to(model.device)
         prompt_ids = input_ids[0].tolist()
 
-        with torch.no_grad():
-            output = model.generate(
-                input_ids,
-                max_new_tokens=getattr(trainer.args, "max_completion_length", 2048),
-                temperature=getattr(trainer.args, "temperature", 1.0),
-                do_sample=True,
-                pad_token_id=tokenizer.pad_token_id,
+        def _timeout_handler(signum, frame):
+            raise TimeoutError(
+                f"model.generate() timed out after {gen_timeout}s on prompt {prompt_idx}. "
+                "Likely broken attention backend."
             )
+
+        old_handler = signal.signal(signal.SIGALRM, _timeout_handler)
+        signal.alarm(gen_timeout)
+        try:
+            with torch.no_grad():
+                output = model.generate(
+                    input_ids,
+                    max_new_tokens=getattr(trainer.args, "max_completion_length", 2048),
+                    temperature=getattr(trainer.args, "temperature", 1.0),
+                    do_sample=True,
+                    pad_token_id=tokenizer.pad_token_id,
+                )
+        finally:
+            signal.alarm(0)
+            signal.signal(signal.SIGALRM, old_handler)
 
         completion_ids = output[0][len(prompt_ids):].tolist()
         text = tokenizer.decode(completion_ids, skip_special_tokens=True)
@@ -356,9 +370,15 @@ def make_multi_turn_rollout(
 
             turn_start = perf_counter()
             active_prompts = [current_prompts[idx] for idx in active_indices]
+            print(
+                f"[rollout] turn {turn + 1}/{max_turns} starting generation "
+                f"for {len(active_prompts)} prompts "
+                f"(max_completion_length={getattr(trainer.args, 'max_completion_length', '?')})"
+            )
             generation_start = perf_counter()
             outputs = generate_rollout_completions(trainer, active_prompts)
             generation_ms = _elapsed_ms(generation_start)
+            print(f"[rollout] turn {turn + 1}/{max_turns} generation complete in {generation_ms:.1f}ms")
 
             pending_jobs: list[dict[str, Any]] = []
             turn_rewards: list[float] = []

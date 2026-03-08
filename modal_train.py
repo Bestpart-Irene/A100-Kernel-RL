@@ -28,17 +28,16 @@ train_image = (
         "nvidia/cuda:12.4.1-cudnn-devel-ubuntu22.04",
         add_python="3.12",
     )
-    # Install unsloth first with its full deps so version constraints are respected.
-    # Unsloth caps: trl<=0.24.0, datasets<4.4.0, transformers<=4.57.6.
+    # Pin torch first so everything resolves against it.
+    .pip_install("torch==2.9.0", "torchvision==0.22.0")
+    # Xformers as attention backend (flash-attn removed — was broken).
+    .pip_install("xformers>=0.0.29")
+    # Unsloth with full deps (caps trl<=0.24.0, datasets<4.4.0).
+    .pip_install("unsloth==2026.3.4", "unsloth_zoo")
+    # Training stack pinned to known-working versions.
     .pip_install(
-        "unsloth",
-        "unsloth_zoo",
-    )
-    .uv_pip_install(
-        "torch>=2.4",
-        "torchvision>=0.19",
-        "trl>=0.18.2,<=0.24.0",
-        "transformers>=4.51.3,<=4.57.6",
+        "trl==0.24.0",
+        "transformers==4.57.6",
         "datasets>=3.4.1,<4.4.0",
         "accelerate>=1.4.0",
         "peft>=0.18.0",
@@ -47,11 +46,15 @@ train_image = (
         "openenv-core[core]>=0.2.1",
         "numpy>=1.26",
         "httpx>=0.27",
-        "vllm>=0.10.2,<=0.12.0",
+        "vllm==0.12.0",
         "modal>=0.70",
     )
-    .run_commands("pip install 'https://github.com/lesj0610/flash-attention/releases/download/v2.8.3-cu12-torch2.10-cp312/flash_attn-2.8.3+cu12torch2.10cxx11abiTRUE-cp312-cp312-linux_x86_64.whl' 2>/dev/null || true")
-    .env({"HF_HUB_ENABLE_HF_TRANSFER": "1"})
+    # NO flash-attn — removed until first training step completes cleanly.
+    .env({
+        "HF_HUB_ENABLE_HF_TRANSFER": "1",
+        "TOKENIZERS_PARALLELISM": "false",
+        "NCCL_P2P_DISABLE": "1",
+    })
     .pip_install("hf_transfer")
     .add_local_python_source(
         "training", "openenv_env", "evaluation", "verification",
@@ -88,6 +91,13 @@ def train(stage: int = 1, max_steps: int | None = None, dry_run: bool = False):
         max_steps: Override max training steps (for cost control)
         dry_run: Just load model + dataset, don't train
     """
+    # Force spawn before any CUDA init to prevent fork deadlocks.
+    import multiprocessing
+    try:
+        multiprocessing.set_start_method("spawn", force=True)
+    except RuntimeError:
+        pass
+
     import torch
     print(f"=== KernelForge Training Stage {stage} ===")
     print(f"GPU: {torch.cuda.get_device_name(0)}")
@@ -308,7 +318,10 @@ def _dry_run_stage1() -> dict:
 
 @app.local_entrypoint()
 def main(stage: int = 1, max_steps: int = 0, dry_run: bool = False):
-    """CLI entrypoint: modal run modal_train.py --stage 1 --max-steps 10"""
+    """CLI entrypoint: modal run --detach modal_train.py --stage 1 --max-steps 10
+
+    IMPORTANT: Always use --detach to prevent client disconnects from killing the run.
+    """
     steps = max_steps if max_steps > 0 else None
     result = train.remote(stage=stage, max_steps=steps, dry_run=dry_run)
     print(f"\nResult: {result}")

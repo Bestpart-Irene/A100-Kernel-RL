@@ -13,11 +13,20 @@ Dataset: CUDA-Agent-Ops-6K easy operators (single-op subset).
 """
 from __future__ import annotations
 
+import multiprocessing
 import os
 import sys
 from pathlib import Path
 
+# Force spawn before any CUDA import to prevent fork deadlocks.
+if sys.platform.startswith("linux"):
+    try:
+        multiprocessing.set_start_method("spawn", force=True)
+    except RuntimeError:
+        pass
+
 os.environ.setdefault("UNSLOTH_VLLM_STANDBY", "1")
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 if __package__ in {None, ""}:
     ROOT = Path(__file__).resolve().parents[1]
@@ -54,7 +63,7 @@ BATCH_EVAL = os.getenv("KERNELFORGE_BATCH_EVAL", "0") == "1"
 # Multi-turn configuration
 MAX_TURNS = int(os.getenv("KERNELFORGE_STAGE1_MAX_TURNS", "3"))
 MAX_STEPS = int(os.getenv("KERNELFORGE_STAGE1_MAX_STEPS", "100"))
-MAX_COMPLETION_LENGTH = int(os.getenv("KERNELFORGE_STAGE1_MAX_COMPLETION_LENGTH", "1024"))
+MAX_COMPLETION_LENGTH = int(os.getenv("KERNELFORGE_STAGE1_MAX_COMPLETION_LENGTH", "256"))
 
 
 # --- Dataset loading ---
@@ -131,6 +140,20 @@ def main():
     dataset = load_stage1_dataset()
     task_rows = [normalize_task_row(row) for row in dataset.to_list()]
 
+    # Canary: verify raw generation works before entering GRPO.
+    print("[canary] Testing raw model.generate()...")
+    import torch
+    _canary_inputs = tokenizer("Write a CUDA vector add kernel.", return_tensors="pt").to(model.device)
+    try:
+        with torch.no_grad():
+            _canary_out = model.generate(
+                **_canary_inputs, max_new_tokens=32, temperature=1.0,
+                do_sample=True, pad_token_id=tokenizer.pad_token_id,
+            )
+        print(f"[canary] PASS — {len(_canary_out[0])} tokens generated")
+    except Exception as e:
+        raise RuntimeError(f"Canary generation failed — model cannot generate: {e}") from e
+
     rollout_func = make_multi_turn_rollout(
         max_turns=MAX_TURNS,
         skill_md_gpu=TARGET_GPU.lower(),
@@ -156,6 +179,7 @@ def main():
         use_vllm=USE_VLLM,
         vllm_mode="colocate" if USE_VLLM else "server",
         vllm_gpu_memory_utilization=VLLM_GPU_MEMORY_UTILIZATION,
+        dataloader_num_workers=0,
     )
 
     trainer = TRLOOGRPOTrainer(
