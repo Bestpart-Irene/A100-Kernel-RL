@@ -68,6 +68,7 @@ def run_benchmark(
     output_path: str | None = None,
     baselines_only: bool = False,
     max_tasks: int | None = None,
+    quant_bits: int = 0,
 ):
     """Run the benchmark and output results."""
     from openenv_env.task_pool import TaskPool
@@ -117,7 +118,7 @@ def run_benchmark(
 
         # Generate CUDA code using the model
         try:
-            cuda_code = _generate_kernel(task, model_name)
+            cuda_code = _generate_kernel(task, model_name, quant_bits=quant_bits)
         except Exception as exc:
             print(f"  GENERATION FAILED: {exc}")
             results.append({
@@ -219,7 +220,7 @@ def run_benchmark(
     return output
 
 
-def _generate_kernel(task: dict, model_name: str) -> str:
+def _generate_kernel(task: dict, model_name: str, quant_bits: int = 0) -> str:
     """Generate a CUDA kernel for a task using the specified model.
 
     This is a placeholder — in production, this calls the model via
@@ -239,11 +240,20 @@ def _generate_kernel(task: dict, model_name: str) -> str:
         import torch
 
         tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+        load_kwargs: dict = {
+            "torch_dtype": torch.bfloat16,
+            "device_map": "auto",
+            "trust_remote_code": True,
+        }
+        if quant_bits in (4, 8):
+            from training.model_loader import _make_bnb_config
+            bnb_config = _make_bnb_config(quant_bits)
+            if bnb_config is not None:
+                load_kwargs["quantization_config"] = bnb_config
+
         model = AutoModelForCausalLM.from_pretrained(
             model_name,
-            torch_dtype=torch.bfloat16,
-            device_map="auto",
-            trust_remote_code=True,
+            **load_kwargs,
         )
 
         messages = [{"role": "user", "content": prompt}]
@@ -286,6 +296,8 @@ def main():
     parser.add_argument("--output", type=str, default="results/benchmark.json")
     parser.add_argument("--baselines-only", action="store_true")
     parser.add_argument("--max-tasks", type=int, default=None)
+    parser.add_argument("--quant-bits", type=int, default=0, choices=[0, 4, 8],
+                        help="Quantization bits: 0=bf16, 4=NF4, 8=INT8 (recommended)")
     args = parser.parse_args()
 
     run_benchmark(
@@ -294,6 +306,7 @@ def main():
         output_path=args.output,
         baselines_only=args.baselines_only,
         max_tasks=args.max_tasks,
+        quant_bits=args.quant_bits,
     )
 
 
