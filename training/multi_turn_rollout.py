@@ -210,13 +210,58 @@ def _print_turn_summary(
     )
 
 
+def _generate_rollout_completions_compat(trainer: Any, prompts: list[str]) -> list[dict]:
+    """Compatibility shim for trl.experimental.openenv.generate_rollout_completions.
+
+    Works with trl<=0.24.0 which lacks the openenv experimental module.
+    Returns the same format: list of dicts with prompt_ids, completion_ids, logprobs, text.
+    """
+    import torch
+
+    tokenizer = trainer.processing_class
+    model = trainer.model
+
+    results = []
+    for prompt in prompts:
+        inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=4096)
+        input_ids = inputs["input_ids"].to(model.device)
+        prompt_ids = input_ids[0].tolist()
+
+        with torch.no_grad():
+            output = model.generate(
+                input_ids,
+                max_new_tokens=getattr(trainer.args, "max_completion_length", 2048),
+                temperature=getattr(trainer.args, "temperature", 1.0),
+                do_sample=True,
+                pad_token_id=tokenizer.pad_token_id,
+            )
+
+        completion_ids = output[0][len(prompt_ids):].tolist()
+        text = tokenizer.decode(completion_ids, skip_special_tokens=True)
+
+        # Placeholder logprobs (zeros) — acceptable for GRPO which uses group-relative rewards.
+        logprobs = [0.0] * len(completion_ids)
+
+        results.append({
+            "prompt_ids": prompt_ids,
+            "completion_ids": completion_ids,
+            "logprobs": logprobs,
+            "text": text,
+        })
+
+    return results
+
+
 def make_multi_turn_rollout(
     max_turns: int = 3,
     skill_md_gpu: str | None = None,
     problem_metadata: list[dict] | None = None,
 ) -> Callable:
     """Create a task-aware rollout_func for GRPOTrainer."""
-    from trl.experimental.openenv import generate_rollout_completions
+    try:
+        from trl.experimental.openenv import generate_rollout_completions
+    except (ImportError, ModuleNotFoundError):
+        generate_rollout_completions = _generate_rollout_completions_compat
     from openenv_env.skill_builder import build_skill_md
 
     gpu_name = skill_md_gpu or os.getenv("KERNELFORGE_TARGET_GPU", "a100").lower()
