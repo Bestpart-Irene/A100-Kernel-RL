@@ -14,6 +14,7 @@ import sys
 
 
 APP_NAME = os.getenv("KERNELFORGE_MODAL_APP", "kernelforge-a100")
+SKIP_BENCHMARK = os.getenv("KERNELFORGE_SKIP_BENCHMARK", "0") == "1"
 
 
 def load_baseline_kernel() -> str:
@@ -56,6 +57,10 @@ def main():
         "benchmark_runs": 30,
         "baseline_original_ms": orig_ms,
         "baseline_doublegraph_ms": dg_ms,
+        "evaluation_backend": "wcc",
+        "task_id": "test_modal_eval",
+        "trace_id": "test_modal_eval",
+        "skip_benchmark": SKIP_BENCHMARK,
     })
 
     # Validate results
@@ -81,19 +86,22 @@ def main():
     print(f"  Correct: {correct}")
     print(f"  Verifier: {verifier[:100]}")
 
-    # Check 3: Runtime is positive
-    checks.append(("Runtime > 0", runtime > 0))
+    # Check 3: Runtime path matches mode
+    runtime_ok = runtime > 0 if not SKIP_BENCHMARK else runtime == 0
+    checks.append(("Runtime path", runtime_ok))
     print(f"  Runtime: {runtime:.3f} ms")
 
-    # Check 4: Runtime stats present
-    has_stats = bool(stats and stats.get("median", 0) > 0)
+    # Check 4: Runtime stats present when benchmarking is enabled
+    has_stats = bool(stats and stats.get("median", 0) > 0) if not SKIP_BENCHMARK else True
     checks.append(("Runtime stats", has_stats))
     if stats:
         print(f"  Stats: mean={stats.get('mean', 0):.3f}, median={stats.get('median', 0):.3f}, "
               f"std={stats.get('std', 0):.3f}")
+    elif SKIP_BENCHMARK:
+        print("  Stats: skipped (KERNELFORGE_SKIP_BENCHMARK=1)")
 
     # Check 5: Speedup is reasonable (not NaN or negative)
-    speedup_ok = speedup_orig > 0 if orig_ms else True
+    speedup_ok = speedup_orig > 0 if orig_ms and not SKIP_BENCHMARK else True
     checks.append(("Speedup sanity", speedup_ok))
     print(f"  Speedup vs original: {speedup_orig:.2f}x")
 

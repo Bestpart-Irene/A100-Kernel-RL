@@ -93,6 +93,9 @@ def train(stage: int = 1, max_steps: int | None = None, dry_run: bool = False):
 
     os.environ.setdefault("KERNELFORGE_EVAL_BACKEND", "modal")
     os.environ.setdefault("KERNELFORGE_MODAL_APP", EVAL_APP_NAME)
+    if stage in {0, 1}:
+        os.environ.setdefault("KERNELFORGE_SKIP_BENCHMARK", "1")
+        os.environ.setdefault("KERNELFORGE_DEBUG_TIMINGS", "1")
 
     if stage == 0:
         smoke = _smoke_test()
@@ -112,10 +115,28 @@ def train(stage: int = 1, max_steps: int | None = None, dry_run: bool = False):
     os.environ.setdefault("KERNELFORGE_STAGE3_SCALE_REWARDS", "batch")
     os.environ.setdefault("KERNELFORGE_STAGE3_BETA", "0.0")
     os.environ.setdefault("KERNELFORGE_STAGE3_MAX_PROMPT_LENGTH", "3072")
-    os.environ.setdefault("KERNELFORGE_STAGE1_MAX_TURNS", "3")
     os.environ.setdefault("KERNELFORGE_STAGE3_MAX_TURNS", "3")
-    os.environ.setdefault("CUDA_AGENT_STAGE1_SAMPLES", "100")
     os.environ.setdefault("KERNELFORGE_STAGE3_OPS6K_MAX", "100")
+
+    if stage == 1:
+        os.environ.setdefault("KERNELFORGE_SKIP_BENCHMARK", "1")
+        os.environ.setdefault("KERNELFORGE_DEBUG_TIMINGS", "1")
+        os.environ.setdefault("KERNELFORGE_BATCH_EVAL", "1")
+        os.environ.setdefault("KERNELFORGE_STAGE1_MAX_TURNS", "1")
+        os.environ.setdefault("CUDA_AGENT_STAGE1_SAMPLES", "4")
+        if max_steps is None:
+            os.environ.setdefault("KERNELFORGE_STAGE1_MAX_STEPS", "5")
+        print(
+            "Stage 1 debug defaults: "
+            f"skip_benchmark={os.environ['KERNELFORGE_SKIP_BENCHMARK']} "
+            f"batch_eval={os.environ['KERNELFORGE_BATCH_EVAL']} "
+            f"debug_timings={os.environ['KERNELFORGE_DEBUG_TIMINGS']} "
+            f"max_turns={os.environ['KERNELFORGE_STAGE1_MAX_TURNS']} "
+            f"samples={os.environ['CUDA_AGENT_STAGE1_SAMPLES']}"
+        )
+    else:
+        os.environ.setdefault("KERNELFORGE_STAGE1_MAX_TURNS", "3")
+        os.environ.setdefault("CUDA_AGENT_STAGE1_SAMPLES", "100")
 
     if max_steps is not None:
         os.environ[f"KERNELFORGE_STAGE{stage}_MAX_STEPS"] = str(max_steps)
@@ -218,6 +239,10 @@ def _smoke_test() -> dict:
             {
                 "cuda_code": '#include <torch/extension.h>\n\ntorch::Tensor run_kernel(torch::Tensor x) {\n    return x * 2;\n}\n\nPYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {\n    m.def("run_kernel", &run_kernel);\n}',
                 "task_code": 'import torch\nclass Model(torch.nn.Module):\n  def __init__(self): super().__init__()\n  def forward(self, x): return x * 2\ndef get_inputs(): return [torch.randn(256, device="cuda")]\ndef get_init_inputs(): return []',
+                "evaluation_backend": "ops6k",
+                "task_id": "stage0_smoke",
+                "trace_id": "stage0_smoke",
+                "skip_benchmark": os.getenv("KERNELFORGE_SKIP_BENCHMARK", "0") == "1",
             },
         )
         results["eval"] = {

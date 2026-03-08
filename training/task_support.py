@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import ast
 import json
+import os
 from collections import Counter
 from typing import Any
 
@@ -25,6 +26,18 @@ STATEFUL_MODULE_TOKENS = (
     "register_buffer(",
     "register_parameter(",
 )
+DEBUG_TIMINGS = os.getenv("KERNELFORGE_DEBUG_TIMINGS", "0") == "1"
+SKIP_BENCHMARK_DEFAULT = os.getenv("KERNELFORGE_SKIP_BENCHMARK", "0") == "1"
+_DEBUG_WARMUP_ITERS = int(os.getenv("KERNELFORGE_DEBUG_WARMUP_ITERS", "1"))
+_DEBUG_BENCHMARK_RUNS = int(os.getenv("KERNELFORGE_DEBUG_BENCHMARK_RUNS", "3"))
+_DEFAULT_OPS6K_WARMUP = _DEBUG_WARMUP_ITERS if DEBUG_TIMINGS else 10
+_DEFAULT_OPS6K_RUNS = _DEBUG_BENCHMARK_RUNS if DEBUG_TIMINGS else 10
+_DEFAULT_WCC_WARMUP = _DEBUG_WARMUP_ITERS if DEBUG_TIMINGS else 50
+_DEFAULT_WCC_RUNS = _DEBUG_BENCHMARK_RUNS if DEBUG_TIMINGS else 30
+OPS6K_WARMUP_ITERS = int(os.getenv("KERNELFORGE_OPS6K_WARMUP_ITERS", str(_DEFAULT_OPS6K_WARMUP)))
+OPS6K_BENCHMARK_RUNS = int(os.getenv("KERNELFORGE_OPS6K_BENCHMARK_RUNS", str(_DEFAULT_OPS6K_RUNS)))
+WCC_WARMUP_ITERS = int(os.getenv("KERNELFORGE_WCC_WARMUP_ITERS", str(_DEFAULT_WCC_WARMUP)))
+WCC_BENCHMARK_RUNS = int(os.getenv("KERNELFORGE_WCC_BENCHMARK_RUNS", str(_DEFAULT_WCC_RUNS)))
 
 
 def parse_ops(raw_ops: Any) -> list[str]:
@@ -210,10 +223,13 @@ def build_modal_payload(
     task_row: dict[str, Any],
     baseline_orig_ms: float | None = None,
     baseline_dg_ms: float | None = None,
+    skip_benchmark: bool | None = None,
+    trace_id: str | None = None,
 ) -> tuple[str, dict[str, Any]]:
     """Build the Modal function name + payload for a task row."""
     row = normalize_task_row(task_row)
     backend = row["evaluation_backend"]
+    effective_skip_benchmark = SKIP_BENCHMARK_DEFAULT if skip_benchmark is None else skip_benchmark
 
     if backend == "ops6k":
         return (
@@ -221,9 +237,12 @@ def build_modal_payload(
             {
                 "cuda_code": cuda_code,
                 "task_code": row.get("task_code") or "",
-                "warmup_iters": 10,
-                "benchmark_runs": 10,
+                "warmup_iters": OPS6K_WARMUP_ITERS,
+                "benchmark_runs": OPS6K_BENCHMARK_RUNS,
                 "evaluation_backend": backend,
+                "skip_benchmark": effective_skip_benchmark,
+                "task_id": row.get("task_id", ""),
+                "trace_id": trace_id or "",
             },
         )
 
@@ -233,11 +252,14 @@ def build_modal_payload(
             {
                 "cuda_code": cuda_code,
                 "verify_graphs": 5,
-                "warmup_iters": 50,
-                "benchmark_runs": 30,
+                "warmup_iters": WCC_WARMUP_ITERS,
+                "benchmark_runs": WCC_BENCHMARK_RUNS,
                 "baseline_original_ms": baseline_orig_ms,
                 "baseline_doublegraph_ms": baseline_dg_ms,
                 "evaluation_backend": backend,
+                "skip_benchmark": effective_skip_benchmark,
+                "task_id": row.get("task_id", ""),
+                "trace_id": trace_id or "",
             },
         )
 
@@ -255,6 +277,16 @@ def normalize_eval_result(result: dict[str, Any] | None) -> dict[str, Any]:
     out.setdefault("runtime_stats", {})
     out.setdefault("verifier_msg", "")
     out.setdefault("error", "")
+    out.setdefault("trace_id", "")
+    out.setdefault("task_id", "")
+    out.setdefault("phase_timings", {
+        "compile_ms": 0.0,
+        "correctness_ms": 0.0,
+        "benchmark_eager_ms": 0.0,
+        "benchmark_compile_ms": 0.0,
+        "benchmark_kernel_ms": 0.0,
+        "total_eval_ms": 0.0,
+    })
     return out
 
 
@@ -279,6 +311,8 @@ def evaluate_code_remote(
     task_row: dict[str, Any],
     baseline_orig_ms: float | None = None,
     baseline_dg_ms: float | None = None,
+    skip_benchmark: bool | None = None,
+    trace_id: str | None = None,
 ) -> dict[str, Any]:
     """Dispatch a candidate kernel to the configured eval backend (CoreWeave or Modal)."""
     from openenv_env.eval_backend import dispatch_eval
@@ -288,11 +322,55 @@ def evaluate_code_remote(
         task_row,
         baseline_orig_ms=baseline_orig_ms,
         baseline_dg_ms=baseline_dg_ms,
+        skip_benchmark=skip_benchmark,
+        trace_id=trace_id,
     )
     result = normalize_eval_result(dispatch_eval(fn_name, payload))
     result["reward"] = compute_task_reward(result)
     result["evaluation_backend"] = normalize_task_row(task_row)["evaluation_backend"]
     return result
+
+
+def evaluate_code_remote_batch(
+    cuda_codes: list[str],
+    task_rows: list[dict[str, Any]],
+    baseline_orig_ms: float | None = None,
+    baseline_dg_ms: float | None = None,
+    skip_benchmark: bool | None = None,
+    trace_ids: list[str] | None = None,
+) -> list[dict[str, Any]]:
+    """Dispatch multiple candidates in one backend call."""
+    from openenv_env.eval_backend import dispatch_eval
+
+    payloads: list[dict[str, Any]] = []
+    normalized_rows = [normalize_task_row(row) for row in task_rows]
+    for idx, (cuda_code, row) in enumerate(zip(cuda_codes, normalized_rows)):
+        _, payload = build_modal_payload(
+            cuda_code,
+            row,
+            baseline_orig_ms=baseline_orig_ms,
+            baseline_dg_ms=baseline_dg_ms,
+            skip_benchmark=skip_benchmark,
+            trace_id=trace_ids[idx] if trace_ids and idx < len(trace_ids) else None,
+        )
+        payloads.append(payload)
+
+    raw_results = dispatch_eval("evaluate_kernels_batch", payloads)
+    if not isinstance(raw_results, list):
+        raw_results = []
+
+    results: list[dict[str, Any]] = []
+    for idx, row in enumerate(normalized_rows):
+        raw = raw_results[idx] if idx < len(raw_results) else {
+            "compiles": False,
+            "correct": False,
+            "error": "Missing batch result from evaluator",
+        }
+        result = normalize_eval_result(raw)
+        result["reward"] = compute_task_reward(result)
+        result["evaluation_backend"] = row["evaluation_backend"]
+        results.append(result)
+    return results
 
 
 # Backward-compatible alias
@@ -302,12 +380,16 @@ def evaluate_code_on_modal(
     modal_app_name: str = "",
     baseline_orig_ms: float | None = None,
     baseline_dg_ms: float | None = None,
+    skip_benchmark: bool | None = None,
+    trace_id: str | None = None,
 ) -> dict[str, Any]:
     """Backward-compatible alias — dispatches via eval_backend (ignores modal_app_name)."""
     return evaluate_code_remote(
         cuda_code, task_row,
         baseline_orig_ms=baseline_orig_ms,
         baseline_dg_ms=baseline_dg_ms,
+        skip_benchmark=skip_benchmark,
+        trace_id=trace_id,
     )
 
 

@@ -13,7 +13,9 @@ import re
 import subprocess
 import tempfile
 from pathlib import Path
+from time import perf_counter
 from typing import Any, Callable
+from uuid import uuid4
 
 from training.curriculum import format_topology_context
 from training.run_metadata import utc_timestamp_rfc3339
@@ -22,10 +24,14 @@ from training.task_support import (
     build_prompt_lookup,
     compute_task_reward,
     evaluate_code_remote,
+    evaluate_code_remote_batch,
     normalize_eval_result,
     normalize_task_row,
 )
 LOCAL_COMPILE_CHECK = os.getenv("KERNELFORGE_LOCAL_COMPILE", "1") == "1"
+SKIP_BENCHMARK = os.getenv("KERNELFORGE_SKIP_BENCHMARK", "0") == "1"
+DEBUG_TIMINGS = os.getenv("KERNELFORGE_DEBUG_TIMINGS", "0") == "1"
+BATCH_EVAL = os.getenv("KERNELFORGE_BATCH_EVAL", "0") == "1"
 TARGET_CUDA_ARCH = os.getenv("KERNELFORGE_TARGET_ARCH", "sm_80")
 MAX_FEEDBACK_CHARS = int(os.getenv("KERNELFORGE_MAX_FEEDBACK_CHARS", "1200"))
 MAX_ERROR_CHARS = int(os.getenv("KERNELFORGE_MAX_ERROR_CHARS", "800"))
@@ -58,6 +64,11 @@ def _append_rollout_log(record: dict[str, Any]) -> None:
             f.write(json.dumps(payload) + "\n")
     except OSError:
         pass
+
+
+def _elapsed_ms(start: float) -> float:
+    """Return elapsed wall time in milliseconds."""
+    return round((perf_counter() - start) * 1000.0, 3)
 
 
 def _local_compile_check(code: str) -> tuple[bool, str]:
@@ -146,18 +157,57 @@ def _format_feedback(result: dict, reward: float, turn: int) -> str:
 _baselines_cache: dict[str, Any] | None = None
 
 
-def _get_baselines() -> tuple[float | None, float | None]:
+def _needs_wcc_baselines(task_rows: list[dict[str, Any]]) -> bool:
+    """Return True when this rollout needs runtime baselines."""
+    if SKIP_BENCHMARK:
+        return False
+    return any(normalize_task_row(row).get("evaluation_backend") == "wcc" for row in task_rows)
+
+
+def _get_baselines(required: bool = True) -> tuple[float | None, float | None, float]:
     """Fetch baseline timings from eval backend (cached across calls)."""
+    if not required:
+        return None, None, 0.0
+
     global _baselines_cache
+    fetch_start = perf_counter()
+    fetched = False
     if _baselines_cache is None:
         try:
             from openenv_env.eval_backend import dispatch_eval
 
             _baselines_cache = dispatch_eval("profile_baselines") or {}
+            fetched = True
         except Exception as exc:
             print(f"Baseline profiling failed: {exc}")
             _baselines_cache = {}
-    return _baselines_cache.get("original_ms"), _baselines_cache.get("doublegraph_ms")
+            fetched = True
+    return (
+        _baselines_cache.get("original_ms"),
+        _baselines_cache.get("doublegraph_ms"),
+        _elapsed_ms(fetch_start) if fetched else 0.0,
+    )
+
+
+def _print_turn_summary(
+    turn: int,
+    max_turns: int,
+    active_count: int,
+    remote_count: int,
+    generation_ms: float,
+    dispatch_ms: float,
+    rewards: list[float],
+) -> None:
+    """Emit one compact progress line per rollout turn."""
+    reward_preview = ", ".join(f"{reward:.1f}" for reward in rewards[:8])
+    if len(rewards) > 8:
+        reward_preview += ", ..."
+    mode = "fast" if SKIP_BENCHMARK else "full"
+    print(
+        f"[rollout] turn {turn}/{max_turns} mode={mode} active={active_count} "
+        f"remote={remote_count} gen={generation_ms:.1f}ms dispatch={dispatch_ms:.1f}ms "
+        f"rewards=[{reward_preview}]"
+    )
 
 
 def make_multi_turn_rollout(
@@ -175,110 +225,273 @@ def make_multi_turn_rollout(
     def rollout_func(prompts: list[str], trainer: Any) -> dict:
         tokenizer = trainer.processing_class
         skill_context = build_skill_md(gpu_name)
-        baseline_orig, baseline_dg = _get_baselines()
-
-        all_prompt_ids: list[list[int]] = []
-        all_completion_ids: list[list[int]] = []
-        all_logprobs: list[list[float]] = []
-        all_best_rewards: list[float] = []
-
-        for prompt_idx, prompt in enumerate(prompts):
-            task_row = normalize_task_row(prompt_lookup.get(prompt, {"prompt": prompt}))
+        task_rows = [
+            normalize_task_row(prompt_lookup.get(prompt, {"prompt": prompt}))
+            for prompt in prompts
+        ]
+        base_prompts = []
+        for task_row in task_rows:
             topology_ctx = format_topology_context(task_row)
-            current_prompt = build_generation_prompt(
-                task_row,
-                skill_context=skill_context,
-                topology_context=topology_ctx,
+            base_prompts.append(
+                build_generation_prompt(
+                    task_row,
+                    skill_context=skill_context,
+                    topology_context=topology_ctx,
+                )
+            )
+        current_prompts = list(base_prompts)
+
+        baseline_orig, baseline_dg, baseline_fetch_ms = _get_baselines(
+            required=_needs_wcc_baselines(task_rows)
+        )
+
+        all_prompt_ids: list[list[int]] = [[] for _ in prompts]
+        all_completion_ids: list[list[int]] = [[] for _ in prompts]
+        all_logprobs: list[list[float]] = [[] for _ in prompts]
+        all_best_rewards: list[float] = [-1.0] * len(prompts)
+        done = [False] * len(prompts)
+
+        def finalize_prompt(
+            prompt_idx: int,
+            turn_idx: int,
+            trace_id: str,
+            result: dict[str, Any],
+            reward: float,
+            local_compile_ms: float,
+            dispatch_ms: float,
+            turn_start: float,
+        ) -> None:
+            normalized_result = normalize_eval_result(result)
+            task_row = task_rows[prompt_idx]
+            if reward > all_best_rewards[prompt_idx]:
+                all_best_rewards[prompt_idx] = reward
+
+            _append_rollout_log(
+                {
+                    "prompt_index": prompt_idx,
+                    "turn": turn_idx + 1,
+                    "trace_id": trace_id,
+                    "task_id": task_row.get("task_id", ""),
+                    "evaluation_backend": task_row.get("evaluation_backend"),
+                    "reward": reward,
+                    "compiles": bool(normalized_result.get("compiles")),
+                    "correct": bool(normalized_result.get("correct")),
+                    "runtime_ms": float(normalized_result.get("runtime_ms", 0.0) or 0.0),
+                    "speedup_vs_orig": float(normalized_result.get("speedup_vs_orig", 0.0) or 0.0),
+                    "speedup_vs_dg": float(normalized_result.get("speedup_vs_dg", 0.0) or 0.0),
+                    "baseline_fetch_ms": baseline_fetch_ms if turn_idx == 0 else 0.0,
+                    "generation_ms": generation_ms,
+                    "local_compile_ms": local_compile_ms,
+                    "dispatch_ms": dispatch_ms,
+                    "turn_total_ms": _elapsed_ms(turn_start),
+                    "phase_timings": normalized_result.get("phase_timings", {}),
+                }
             )
 
-            episode_prompt_ids: list[int] = []
-            episode_completion_ids: list[int] = []
-            episode_logprobs: list[float] = []
-            best_reward = -1.0
-
-            for turn in range(max_turns):
-                outputs = generate_rollout_completions(trainer, [current_prompt])[0]
-                episode_prompt_ids.extend(outputs["prompt_ids"])
-                episode_completion_ids.extend(outputs["completion_ids"])
-                episode_logprobs.extend(outputs["logprobs"])
-
-                completion_text = outputs.get("text") or tokenizer.decode(
-                    outputs["completion_ids"], skip_special_tokens=True
+            if DEBUG_TIMINGS:
+                phase_timings = normalized_result.get("phase_timings", {})
+                print(
+                    f"[rollout] trace={trace_id} task={task_row.get('task_id', '') or prompt_idx} "
+                    f"turn={turn_idx + 1} compile={local_compile_ms:.1f}ms "
+                    f"dispatch={dispatch_ms:.1f}ms total={_elapsed_ms(turn_start):.1f}ms "
+                    f"eval={phase_timings}"
                 )
+
+            if reward >= 3.0 or turn_idx == max_turns - 1:
+                done[prompt_idx] = True
+                return
+
+            feedback = _format_feedback(normalized_result, reward, turn_idx)
+            current_prompts[prompt_idx] = base_prompts[prompt_idx] + f"\n\n{feedback}"
+
+        for turn in range(max_turns):
+            active_indices = [idx for idx, is_done in enumerate(done) if not is_done]
+            if not active_indices:
+                break
+
+            turn_start = perf_counter()
+            active_prompts = [current_prompts[idx] for idx in active_indices]
+            generation_start = perf_counter()
+            outputs = generate_rollout_completions(trainer, active_prompts)
+            generation_ms = _elapsed_ms(generation_start)
+
+            pending_jobs: list[dict[str, Any]] = []
+            turn_rewards: list[float] = []
+            total_dispatch_ms = 0.0
+
+            for output_idx, prompt_idx in enumerate(active_indices):
+                outputs_for_prompt = outputs[output_idx]
+                all_prompt_ids[prompt_idx].extend(outputs_for_prompt["prompt_ids"])
+                all_completion_ids[prompt_idx].extend(outputs_for_prompt["completion_ids"])
+                all_logprobs[prompt_idx].extend(outputs_for_prompt["logprobs"])
+
+                completion_text = outputs_for_prompt.get("text") or tokenizer.decode(
+                    outputs_for_prompt["completion_ids"], skip_special_tokens=True
+                )
+                trace_id = uuid4().hex
+                local_compile_ms = 0.0
+
                 code = extract_cuda_code(completion_text)
                 if not code:
                     reward = -1.0
                     result = {
                         "compiles": False,
                         "correct": False,
+                        "trace_id": trace_id,
+                        "task_id": task_rows[prompt_idx].get("task_id", ""),
                         "error": (
                             "No valid CUDA/C++ code was found. Return a fenced code block "
                             "or a raw CUDA extension source file."
                         ),
                     }
-                else:
-                    compiles_locally, compile_err = _local_compile_check(code)
-                    if not compiles_locally:
-                        reward = -1.0
-                        result = {"compiles": False, "correct": False, "error": compile_err[:200]}
-                    elif not task_row.get("supports_evaluation"):
-                        reward = -1.0
-                        result = {
-                            "compiles": False,
-                            "correct": False,
-                            "error": task_row.get("support_reason", "Unsupported evaluation backend"),
-                        }
-                    else:
-                        try:
-                            result = evaluate_code_remote(
-                                code,
-                                task_row,
-                                baseline_orig_ms=baseline_orig,
-                                baseline_dg_ms=baseline_dg,
-                            )
-                            reward = float(result.get("reward", _compute_reward_from_result(result)))
-                        except Exception as exc:
-                            print(f"  [Turn {turn + 1}] Eval dispatch failed: {exc}")
-                            reward = -1.0
-                            result = {"compiles": False, "correct": False, "error": str(exc)[:200]}
+                    finalize_prompt(prompt_idx, turn, trace_id, result, reward, 0.0, 0.0, turn_start)
+                    turn_rewards.append(reward)
+                    continue
 
-                if reward > best_reward:
-                    best_reward = reward
+                local_compile_start = perf_counter()
+                compiles_locally, compile_err = _local_compile_check(code)
+                local_compile_ms = _elapsed_ms(local_compile_start)
+                if not compiles_locally:
+                    reward = -1.0
+                    result = {
+                        "compiles": False,
+                        "correct": False,
+                        "trace_id": trace_id,
+                        "task_id": task_rows[prompt_idx].get("task_id", ""),
+                        "error": compile_err[:200],
+                    }
+                    finalize_prompt(
+                        prompt_idx,
+                        turn,
+                        trace_id,
+                        result,
+                        reward,
+                        local_compile_ms,
+                        0.0,
+                        turn_start,
+                    )
+                    turn_rewards.append(reward)
+                    continue
 
-                _append_rollout_log(
+                if not task_rows[prompt_idx].get("supports_evaluation"):
+                    reward = -1.0
+                    result = {
+                        "compiles": False,
+                        "correct": False,
+                        "trace_id": trace_id,
+                        "task_id": task_rows[prompt_idx].get("task_id", ""),
+                        "error": task_rows[prompt_idx].get(
+                            "support_reason", "Unsupported evaluation backend"
+                        ),
+                    }
+                    finalize_prompt(
+                        prompt_idx,
+                        turn,
+                        trace_id,
+                        result,
+                        reward,
+                        local_compile_ms,
+                        0.0,
+                        turn_start,
+                    )
+                    turn_rewards.append(reward)
+                    continue
+
+                pending_jobs.append(
                     {
-                        "prompt_index": prompt_idx,
-                        "turn": turn + 1,
-                        "evaluation_backend": task_row.get("evaluation_backend"),
-                        "reward": reward,
-                        "compiles": bool(result.get("compiles")),
-                        "correct": bool(result.get("correct")),
-                        "runtime_ms": float(result.get("runtime_ms", 0.0) or 0.0),
-                        "speedup_vs_orig": float(result.get("speedup_vs_orig", 0.0) or 0.0),
-                        "speedup_vs_dg": float(result.get("speedup_vs_dg", 0.0) or 0.0),
+                        "prompt_idx": prompt_idx,
+                        "trace_id": trace_id,
+                        "code": code,
+                        "local_compile_ms": local_compile_ms,
+                        "task_row": task_rows[prompt_idx],
                     }
                 )
 
-                if reward >= 3.0 or turn == max_turns - 1:
-                    break
+            if pending_jobs:
+                if BATCH_EVAL:
+                    dispatch_start = perf_counter()
+                    try:
+                        batch_results = evaluate_code_remote_batch(
+                            [job["code"] for job in pending_jobs],
+                            [job["task_row"] for job in pending_jobs],
+                            baseline_orig_ms=baseline_orig,
+                            baseline_dg_ms=baseline_dg,
+                            skip_benchmark=SKIP_BENCHMARK,
+                            trace_ids=[job["trace_id"] for job in pending_jobs],
+                        )
+                    except Exception as exc:
+                        batch_results = [
+                            normalize_eval_result(
+                                {
+                                    "compiles": False,
+                                    "correct": False,
+                                    "trace_id": job["trace_id"],
+                                    "task_id": job["task_row"].get("task_id", ""),
+                                    "error": str(exc)[:200],
+                                }
+                            )
+                            for job in pending_jobs
+                        ]
+                    total_dispatch_ms = _elapsed_ms(dispatch_start)
 
-                feedback = _format_feedback(result, reward, turn)
-                current_prompt = build_generation_prompt(
-                    task_row,
-                    skill_context=skill_context,
-                    topology_context=topology_ctx,
-                ) + f"\n\n{feedback}"
+                    for job, result in zip(pending_jobs, batch_results):
+                        reward = float(result.get("reward", _compute_reward_from_result(result)))
+                        finalize_prompt(
+                            job["prompt_idx"],
+                            turn,
+                            job["trace_id"],
+                            result,
+                            reward,
+                            job["local_compile_ms"],
+                            total_dispatch_ms,
+                            turn_start,
+                        )
+                        turn_rewards.append(reward)
+                else:
+                    for job in pending_jobs:
+                        dispatch_start = perf_counter()
+                        try:
+                            result = evaluate_code_remote(
+                                job["code"],
+                                job["task_row"],
+                                baseline_orig_ms=baseline_orig,
+                                baseline_dg_ms=baseline_dg,
+                                skip_benchmark=SKIP_BENCHMARK,
+                                trace_id=job["trace_id"],
+                            )
+                        except Exception as exc:
+                            print(f"  [Turn {turn + 1}] Eval dispatch failed: {exc}")
+                            result = {
+                                "compiles": False,
+                                "correct": False,
+                                "trace_id": job["trace_id"],
+                                "task_id": job["task_row"].get("task_id", ""),
+                                "error": str(exc)[:200],
+                            }
+                        dispatch_ms = _elapsed_ms(dispatch_start)
+                        total_dispatch_ms += dispatch_ms
+                        reward = float(result.get("reward", _compute_reward_from_result(result)))
+                        finalize_prompt(
+                            job["prompt_idx"],
+                            turn,
+                            job["trace_id"],
+                            result,
+                            reward,
+                            job["local_compile_ms"],
+                            dispatch_ms,
+                            turn_start,
+                        )
+                        turn_rewards.append(reward)
 
-            all_prompt_ids.append(episode_prompt_ids)
-            all_completion_ids.append(episode_completion_ids)
-            all_logprobs.append(episode_logprobs)
-            all_best_rewards.append(best_reward)
-
-            if (prompt_idx + 1) % 10 == 0 or prompt_idx == 0:
-                print(
-                    f"  Rollout {prompt_idx + 1}/{len(prompts)}: "
-                    f"best_reward={best_reward:.3f} backend={task_row.get('evaluation_backend')}"
-                )
+            _print_turn_summary(
+                turn=turn + 1,
+                max_turns=max_turns,
+                active_count=len(active_indices),
+                remote_count=len(pending_jobs),
+                generation_ms=generation_ms,
+                dispatch_ms=total_dispatch_ms,
+                rewards=turn_rewards,
+            )
 
         return {
             "prompt_ids": all_prompt_ids,

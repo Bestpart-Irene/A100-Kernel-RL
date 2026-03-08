@@ -40,6 +40,9 @@ USE_VLLM = os.getenv("KERNELFORGE_USE_VLLM", "0") == "1" and IS_LINUX
 VLLM_GPU_MEMORY_UTILIZATION = float(os.getenv("KERNELFORGE_VLLM_GPU_MEMORY_UTILIZATION", "0.6"))
 OPTIMIZER = "paged_adamw_8bit" if IS_LINUX else "adamw_torch"
 USE_BF16 = IS_LINUX
+SKIP_BENCHMARK = os.getenv("KERNELFORGE_SKIP_BENCHMARK", "0") == "1"
+DEBUG_TIMINGS = os.getenv("KERNELFORGE_DEBUG_TIMINGS", "0") == "1"
+BATCH_EVAL = os.getenv("KERNELFORGE_BATCH_EVAL", "0") == "1"
 
 # Multi-turn configuration
 MAX_TURNS = int(os.getenv("KERNELFORGE_STAGE1_MAX_TURNS", "3"))
@@ -112,6 +115,10 @@ def main():
     print(f"  Max turns per episode: {MAX_TURNS}")
     print(f"  Max training steps: {MAX_STEPS}")
     print(f"  Max completion length: {MAX_COMPLETION_LENGTH}")
+    print(
+        "  Rollout mode: "
+        f"skip_benchmark={SKIP_BENCHMARK} batch_eval={BATCH_EVAL} debug_timings={DEBUG_TIMINGS}"
+    )
 
     model, tokenizer = load_model_and_tokenizer()
     dataset = load_stage1_dataset()

@@ -17,6 +17,7 @@ import sys
 APP_NAME = os.getenv("KERNELFORGE_MODAL_APP", "kernelforge-a100")
 TARGET_GPU = os.getenv("KERNELFORGE_TARGET_GPU", "A100")
 TARGET_ARCH = os.getenv("KERNELFORGE_TARGET_ARCH", "sm_80")
+SKIP_BENCHMARK = os.getenv("KERNELFORGE_SKIP_BENCHMARK", "0") == "1"
 
 
 def check_modal_installed() -> bool:
@@ -129,6 +130,10 @@ extern "C" __global__ void wcc_kernel(const int* row_ptr, const int* col_idx, in
             "verify_graphs": 5,
             "warmup_iters": 10,
             "benchmark_runs": 5,
+            "evaluation_backend": "wcc",
+            "task_id": "modal_setup_smoke",
+            "trace_id": "modal_setup_smoke",
+            "skip_benchmark": SKIP_BENCHMARK,
         })
         print(f"  Compiles: {result.get('compiles', False)}")
         print(f"  Correct: {result.get('correct', False)}")

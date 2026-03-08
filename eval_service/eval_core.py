@@ -10,6 +10,8 @@ import os
 import re
 import subprocess
 import tempfile
+from time import perf_counter
+from types import ModuleType
 from typing import Any
 
 import numpy as np
@@ -24,6 +26,9 @@ TARGET_CUDA_ARCH = os.getenv(
 )
 BASELINE_KERNEL = os.getenv("KERNELFORGE_BASELINE_KERNEL", "baseline_wcc.cu")
 SECONDARY_BASELINE_KERNEL = os.getenv("KERNELFORGE_SECONDARY_BASELINE_KERNEL", "")
+DEBUG_TIMINGS = os.getenv("KERNELFORGE_DEBUG_TIMINGS", "0") == "1"
+_OPS_REFERENCE_CACHE_LIMIT = int(os.getenv("KERNELFORGE_OPS_REFERENCE_CACHE_LIMIT", "16"))
+_OPS_REFERENCE_CACHE: dict[str, dict[str, Any]] = {}
 
 
 # --- Helper functions ---
@@ -184,6 +189,97 @@ def _module_name(prefix: str, payload: str) -> str:
     return f"{prefix}_{digest}"
 
 
+def _elapsed_ms(start: float) -> float:
+    """Return elapsed wall time in milliseconds."""
+    return round((perf_counter() - start) * 1000.0, 3)
+
+
+def _empty_phase_timings() -> dict[str, float]:
+    """Create the canonical phase timing payload."""
+    return {
+        "compile_ms": 0.0,
+        "correctness_ms": 0.0,
+        "benchmark_eager_ms": 0.0,
+        "benchmark_compile_ms": 0.0,
+        "benchmark_kernel_ms": 0.0,
+        "total_eval_ms": 0.0,
+    }
+
+
+def _finalize_eval_result(result: dict[str, Any], total_start: float) -> dict[str, Any]:
+    """Attach total timing and emit one debug line if requested."""
+    phase_timings = result.setdefault("phase_timings", _empty_phase_timings())
+    for key, value in _empty_phase_timings().items():
+        phase_timings.setdefault(key, value)
+    phase_timings["total_eval_ms"] = _elapsed_ms(total_start)
+
+    if DEBUG_TIMINGS:
+        print(
+            f"[eval] trace={result.get('trace_id', '')} task={result.get('task_id', '')} "
+            f"backend={result.get('evaluation_backend', '')} compiles={result.get('compiles', False)} "
+            f"correct={result.get('correct', False)} phases={phase_timings}"
+        )
+    return result
+
+
+def _normalize_init_inputs(init_inputs: Any) -> list[Any]:
+    """Normalize get_init_inputs() into a list."""
+    if init_inputs is None:
+        return []
+    if isinstance(init_inputs, (list, tuple)):
+        return list(init_inputs)
+    return [init_inputs]
+
+
+def _value_signature(value: Any) -> Any:
+    """Build a stable structure signature for nested benchmark inputs."""
+    try:
+        import torch
+    except Exception:  # pragma: no cover - torch import handled by caller
+        torch = None
+
+    if torch is not None and isinstance(value, torch.Tensor):
+        return ("tensor", tuple(value.shape), str(value.dtype), str(value.device))
+    if isinstance(value, list):
+        return tuple(_value_signature(item) for item in value)
+    if isinstance(value, tuple):
+        return tuple(_value_signature(item) for item in value)
+    if isinstance(value, dict):
+        return tuple(sorted((key, _value_signature(item)) for key, item in value.items()))
+    return ("scalar", type(value).__name__, repr(value))
+
+
+def _get_ops_reference_entry(task_code: str, torch) -> dict[str, Any]:
+    """Cache reference module/model artifacts across warm worker invocations."""
+    cache_key = hashlib.sha256(task_code.encode("utf-8")).hexdigest()
+    cached = _OPS_REFERENCE_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    module = ModuleType(f"ops_ref_{cache_key[:12]}")
+    module.__dict__["__file__"] = f"<ops_ref_{cache_key[:12]}>"
+    exec(task_code, module.__dict__)
+
+    init_inputs = _normalize_init_inputs(module.get_init_inputs())
+    ref_model = module.Model(*init_inputs).eval().cuda()
+    cached = {
+        "module": module,
+        "ref_model": ref_model,
+        "eager_baselines": {},
+        "compile_baselines": {},
+        "compiled_models": {},
+    }
+    _OPS_REFERENCE_CACHE[cache_key] = cached
+
+    while len(_OPS_REFERENCE_CACHE) > _OPS_REFERENCE_CACHE_LIMIT:
+        oldest_key = next(iter(_OPS_REFERENCE_CACHE))
+        if oldest_key == cache_key:
+            break
+        _OPS_REFERENCE_CACHE.pop(oldest_key, None)
+
+    return cached
+
+
 def edges_to_csr(edges, num_vertices):
     """Convert edge list to CSR format."""
     adj = [[] for _ in range(num_vertices)]
@@ -320,13 +416,21 @@ def evaluate_kernel_impl(payload: dict) -> dict:
         speedup_vs_dg: float
         error: str
     """
+    total_start = perf_counter()
     cuda_code = payload.get("cuda_code", "")
     baseline_orig_ms = payload.get("baseline_original_ms")
     baseline_dg_ms = payload.get("baseline_doublegraph_ms")
+    trace_id = str(payload.get("trace_id", ""))
+    task_id = str(payload.get("task_id", ""))
+    evaluation_backend = str(payload.get("evaluation_backend", "wcc"))
+    skip_benchmark = bool(payload.get("skip_benchmark", False))
     result = {
         "compiles": False, "correct": False, "verifier_msg": "",
         "runtime_ms": 0.0, "runtime_stats": {},
         "speedup_vs_orig": 0.0, "speedup_vs_dg": 0.0, "error": "",
+        "trace_id": trace_id, "task_id": task_id,
+        "evaluation_backend": evaluation_backend,
+        "phase_timings": _empty_phase_timings(),
     }
 
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -337,6 +441,7 @@ def evaluate_kernel_impl(payload: dict) -> dict:
             f.write(cuda_code)
 
         # Step 1: Compile for target architecture
+        compile_start = perf_counter()
         try:
             proc = subprocess.run(
                 _nvcc_command(src_path, lib_path, cuda_code),
@@ -344,19 +449,23 @@ def evaluate_kernel_impl(payload: dict) -> dict:
             )
             if proc.returncode != 0:
                 result["error"] = proc.stderr[:2000]
-                return result
+                result["phase_timings"]["compile_ms"] = _elapsed_ms(compile_start)
+                return _finalize_eval_result(result, total_start)
         except subprocess.TimeoutExpired:
             result["error"] = "Compilation timed out (30s limit)"
-            return result
+            result["phase_timings"]["compile_ms"] = _elapsed_ms(compile_start)
+            return _finalize_eval_result(result, total_start)
+        result["phase_timings"]["compile_ms"] = _elapsed_ms(compile_start)
 
         forbidden_reason = scan_forbidden_symbols(lib_path)
         if forbidden_reason:
             result["error"] = forbidden_reason
-            return result
+            return _finalize_eval_result(result, total_start)
 
         result["compiles"] = True
 
         # Step 2: PAC Verification (5 adversarial graphs)
+        correctness_start = perf_counter()
         try:
             from verification.pac_verify import generate_test_graphs, verify_wcc, run_kernel_verification
 
@@ -378,10 +487,15 @@ def evaluate_kernel_impl(payload: dict) -> dict:
         except Exception as e:
             result["correct"] = False
             result["verifier_msg"] = f"Verification exception: {str(e)[:500]}"
-            return result
+            result["phase_timings"]["correctness_ms"] = _elapsed_ms(correctness_start)
+            return _finalize_eval_result(result, total_start)
+        result["phase_timings"]["correctness_ms"] = _elapsed_ms(correctness_start)
 
         # Step 3: Benchmark with cudaEvent timing
-        if result["correct"]:
+        if result["correct"] and skip_benchmark:
+            result["verifier_msg"] = f"{result['verifier_msg']} (benchmark skipped)"
+        elif result["correct"]:
+            benchmark_start = perf_counter()
             try:
                 import cupy as cp
 
@@ -421,6 +535,7 @@ def evaluate_kernel_impl(payload: dict) -> dict:
                     result["speedup_vs_dg"] = float(baseline_dg_ms) / result["runtime_ms"]
             except Exception as e:
                 result["error"] = f"Benchmark exception: {str(e)[:500]}"
+            result["phase_timings"]["benchmark_kernel_ms"] = _elapsed_ms(benchmark_start)
 
         # Step 4: Lightweight profiling (occupancy + register info from ptxas)
         try:
@@ -457,7 +572,7 @@ def evaluate_kernel_impl(payload: dict) -> dict:
         except Exception:
             pass  # Profiling is best-effort
 
-    return result
+    return _finalize_eval_result(result, total_start)
 
 
 def profile_baselines_impl() -> dict:
@@ -563,6 +678,8 @@ def test_gpu_features_impl() -> dict:
 
 def evaluate_kernels_batch_impl(payloads: list[dict]) -> list[dict]:
     """Evaluate multiple kernels in a single call."""
+    if DEBUG_TIMINGS:
+        print(f"[eval-batch] payload_count={len(payloads)}")
     results = []
     for payload in payloads:
         try:
@@ -601,14 +718,17 @@ def evaluate_ops6k_kernel_impl(payload: dict) -> dict:
         speedup_vs_dg: float
         error: str
     """
-    import importlib.util
-    import sys
     import torch
 
+    total_start = perf_counter()
     cuda_code = payload.get("cuda_code", "")
     task_code = payload.get("task_code", "")
     warmup_iters = int(payload.get("warmup_iters", 10))
     benchmark_runs = int(payload.get("benchmark_runs", 10))
+    skip_benchmark = bool(payload.get("skip_benchmark", False))
+    trace_id = str(payload.get("trace_id", ""))
+    task_id = str(payload.get("task_id", ""))
+    evaluation_backend = str(payload.get("evaluation_backend", "ops6k"))
 
     result = {
         "compiles": False,
@@ -621,29 +741,29 @@ def evaluate_ops6k_kernel_impl(payload: dict) -> dict:
         "speedup_vs_dg": 0.0,
         "verifier_msg": "",
         "error": "",
+        "trace_id": trace_id,
+        "task_id": task_id,
+        "evaluation_backend": evaluation_backend,
+        "phase_timings": _empty_phase_timings(),
     }
 
     if not cuda_code or not task_code:
         result["error"] = "Missing cuda_code or task_code"
-        return result
+        return _finalize_eval_result(result, total_start)
     if not _ops_task_supported(task_code):
         result["error"] = (
             "Unsupported Ops task for live evaluation: only stateless tasks with empty "
             "get_init_inputs() are executable with the current extension harness."
         )
-        return result
+        return _finalize_eval_result(result, total_start)
 
     with tempfile.TemporaryDirectory() as tmpdir:
-        model_path = os.path.join(tmpdir, "model.py")
-        with open(model_path, "w", encoding="utf-8") as f:
-            f.write(task_code)
-
         kernel_path = os.path.join(tmpdir, "kernel.cu")
         with open(kernel_path, "w", encoding="utf-8") as f:
             f.write(cuda_code)
 
+        compile_start = perf_counter()
         try:
-            sys.path.insert(0, tmpdir)
             import torch.utils.cpp_extension as cpp_ext
 
             build_dir = os.path.join(tmpdir, "build")
@@ -666,34 +786,25 @@ def evaluate_ops6k_kernel_impl(payload: dict) -> dict:
                     "Compiled extension does not expose run_kernel. "
                     "Return a PYBIND11_MODULE with m.def(\"run_kernel\", &run_kernel)."
                 )
-                return result
+                result["phase_timings"]["compile_ms"] = _elapsed_ms(compile_start)
+                return _finalize_eval_result(result, total_start)
             result["compiles"] = True
         except Exception as exc:
             result["error"] = f"Compilation failed: {str(exc)[:1500]}"
-            return result
-        finally:
-            try:
-                sys.path.remove(tmpdir)
-            except ValueError:
-                pass
+            result["phase_timings"]["compile_ms"] = _elapsed_ms(compile_start)
+            return _finalize_eval_result(result, total_start)
+        result["phase_timings"]["compile_ms"] = _elapsed_ms(compile_start)
 
+        correctness_start = perf_counter()
         try:
             torch.manual_seed(42)
-            spec = importlib.util.spec_from_file_location("ref_model", model_path)
-            ref_mod = importlib.util.module_from_spec(spec)
-            assert spec.loader is not None
-            spec.loader.exec_module(ref_mod)
-
-            init_inputs = ref_mod.get_init_inputs()
-            if init_inputs is None:
-                init_inputs = []
-            if not isinstance(init_inputs, (list, tuple)):
-                init_inputs = [init_inputs]
-
-            ref_model = ref_mod.Model(*init_inputs).eval().cuda()
+            cache_entry = _get_ops_reference_entry(task_code, torch)
+            ref_mod = cache_entry["module"]
+            ref_model = cache_entry["ref_model"]
         except Exception as exc:
             result["error"] = f"Reference model load failed: {str(exc)[:500]}"
-            return result
+            result["phase_timings"]["correctness_ms"] = _elapsed_ms(correctness_start)
+            return _finalize_eval_result(result, total_start)
 
         try:
             # Collect outputs for anti-hack checks (need 2+ distinct input sets)
@@ -727,7 +838,8 @@ def evaluate_ops6k_kernel_impl(payload: dict) -> dict:
         except Exception as exc:
             result["error"] = f"Correctness check failed: {str(exc)[:800]}"
             result["verifier_msg"] = result["error"]
-            return result
+            result["phase_timings"]["correctness_ms"] = _elapsed_ms(correctness_start)
+            return _finalize_eval_result(result, total_start)
 
         # Anti-hack checks (Dr. Kernel-inspired)
         try:
@@ -746,7 +858,8 @@ def evaluate_ops6k_kernel_impl(payload: dict) -> dict:
                     result["correct"] = False
                     result["error"] = f"Anti-hack: {reason}"
                     result["verifier_msg"] = result["error"]
-                    return result
+                    result["phase_timings"]["correctness_ms"] = _elapsed_ms(correctness_start)
+                    return _finalize_eval_result(result, total_start)
 
             # Constant output check
             if len(anti_hack_candidate_outputs) >= 2:
@@ -757,7 +870,8 @@ def evaluate_ops6k_kernel_impl(payload: dict) -> dict:
                     result["correct"] = False
                     result["error"] = f"Anti-hack: {reason}"
                     result["verifier_msg"] = result["error"]
-                    return result
+                    result["phase_timings"]["correctness_ms"] = _elapsed_ms(correctness_start)
+                    return _finalize_eval_result(result, total_start)
 
             # Passthrough check
             if anti_hack_inputs:
@@ -768,9 +882,15 @@ def evaluate_ops6k_kernel_impl(payload: dict) -> dict:
                     result["correct"] = False
                     result["error"] = f"Anti-hack: {reason}"
                     result["verifier_msg"] = result["error"]
-                    return result
+                    result["phase_timings"]["correctness_ms"] = _elapsed_ms(correctness_start)
+                    return _finalize_eval_result(result, total_start)
         except Exception:
             pass  # Anti-hack is best-effort, don't fail the whole eval
+        result["phase_timings"]["correctness_ms"] = _elapsed_ms(correctness_start)
+
+        if skip_benchmark:
+            result["verifier_msg"] = f"{result['verifier_msg']} (benchmark skipped)"
+            return _finalize_eval_result(result, total_start)
 
         try:
             torch.manual_seed(42)
@@ -778,50 +898,71 @@ def evaluate_ops6k_kernel_impl(payload: dict) -> dict:
             if not isinstance(bench_inputs, (list, tuple)):
                 bench_inputs = [bench_inputs]
             bench_inputs = _move_to_cuda(bench_inputs, torch)
+            bench_key = (
+                warmup_iters,
+                benchmark_runs,
+                _value_signature(bench_inputs),
+            )
+            eager_cache = cache_entry["eager_baselines"]
+            compile_cache = cache_entry["compile_baselines"]
+            compiled_models = cache_entry["compiled_models"]
 
-            for _ in range(warmup_iters):
-                with torch.no_grad():
-                    ref_model(*_clone_value(bench_inputs))
-            torch.cuda.synchronize()
-
-            eager_times = []
-            for _ in range(benchmark_runs):
-                start_evt = torch.cuda.Event(enable_timing=True)
-                end_evt = torch.cuda.Event(enable_timing=True)
-                start_evt.record()
-                with torch.no_grad():
-                    ref_model(*_clone_value(bench_inputs))
-                end_evt.record()
-                end_evt.synchronize()
-                eager_times.append(start_evt.elapsed_time(end_evt))
-
-            eager_ms = float(np.median(eager_times))
-            result["baseline_eager_ms"] = eager_ms
-
-            compile_ms = 0.0
-            try:
-                compiled_model = torch.compile(ref_model)
+            eager_timing_start = perf_counter()
+            eager_ms = eager_cache.get(bench_key)
+            if eager_ms is None:
                 for _ in range(warmup_iters):
                     with torch.no_grad():
-                        compiled_model(*_clone_value(bench_inputs))
+                        ref_model(*_clone_value(bench_inputs))
                 torch.cuda.synchronize()
 
-                compile_times = []
+                eager_times = []
                 for _ in range(benchmark_runs):
                     start_evt = torch.cuda.Event(enable_timing=True)
                     end_evt = torch.cuda.Event(enable_timing=True)
                     start_evt.record()
                     with torch.no_grad():
-                        compiled_model(*_clone_value(bench_inputs))
+                        ref_model(*_clone_value(bench_inputs))
                     end_evt.record()
                     end_evt.synchronize()
-                    compile_times.append(start_evt.elapsed_time(end_evt))
+                    eager_times.append(start_evt.elapsed_time(end_evt))
+                eager_ms = float(np.median(eager_times))
+                eager_cache[bench_key] = eager_ms
+            result["phase_timings"]["benchmark_eager_ms"] = _elapsed_ms(eager_timing_start)
+            result["baseline_eager_ms"] = eager_ms
 
-                compile_ms = float(np.median(compile_times))
+            compile_timing_start = perf_counter()
+            compile_ms = compile_cache.get(bench_key, 0.0)
+            try:
+                if bench_key not in compile_cache:
+                    compiled_model = compiled_models.get(bench_key)
+                    if compiled_model is None:
+                        compiled_model = torch.compile(ref_model)
+                        compiled_models[bench_key] = compiled_model
+
+                    for _ in range(warmup_iters):
+                        with torch.no_grad():
+                            compiled_model(*_clone_value(bench_inputs))
+                    torch.cuda.synchronize()
+
+                    compile_times = []
+                    for _ in range(benchmark_runs):
+                        start_evt = torch.cuda.Event(enable_timing=True)
+                        end_evt = torch.cuda.Event(enable_timing=True)
+                        start_evt.record()
+                        with torch.no_grad():
+                            compiled_model(*_clone_value(bench_inputs))
+                        end_evt.record()
+                        end_evt.synchronize()
+                        compile_times.append(start_evt.elapsed_time(end_evt))
+
+                    compile_ms = float(np.median(compile_times))
+                    compile_cache[bench_key] = compile_ms
             except Exception:
                 compile_ms = 0.0
+            result["phase_timings"]["benchmark_compile_ms"] = _elapsed_ms(compile_timing_start)
             result["baseline_compile_ms"] = compile_ms
 
+            kernel_timing_start = perf_counter()
             for _ in range(warmup_iters):
                 extension.run_kernel(*_clone_value(bench_inputs))
             torch.cuda.synchronize()
@@ -867,7 +1008,12 @@ def evaluate_ops6k_kernel_impl(payload: dict) -> dict:
                     result["speedup_vs_dg"] = 0.0
             except Exception:
                 pass
+            result["phase_timings"]["benchmark_kernel_ms"] = _elapsed_ms(kernel_timing_start)
         except Exception as exc:
             result["error"] = f"Profiling failed: {str(exc)[:500]}"
+            result["phase_timings"]["benchmark_kernel_ms"] = max(
+                result["phase_timings"]["benchmark_kernel_ms"],
+                0.0,
+            )
 
-    return result
+    return _finalize_eval_result(result, total_start)
