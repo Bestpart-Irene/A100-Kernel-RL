@@ -1,0 +1,62 @@
+# Core training
+#
+# INSTALL ORDER (on Linux + CUDA):
+#   1. pip install --no-deps unsloth unsloth_zoo   # bypass stale trl<=0.24.0 cap
+#   2. pip install "trl[vllm]>=0.29.0"             # pulls torch, vllm, transformers, accelerate
+#   3. pip install -r requirements.txt             # everything else
+#
+# unsloth 2026.3.3 with --no-deps + PatchFastRL("GRPO", FastLanguageModel)
+# See: https://github.com/unslothai/unsloth/releases/tag/December-2025
+trl[vllm]>=0.29.0; platform_system == "Linux"   # Full GRPO + vLLM stack on B200/A100 Linux
+trl>=0.29.0; platform_system != "Linux"         # Control-plane install for macOS preflight
+transformers>=4.56.2,!=5.0.0,!=5.1.0  # Per trl 0.29.0 + unsloth exclusions
+datasets>=3.0
+accelerate>=1.4.0             # Required by trl 0.29.0
+peft>=0.17.0
+bitsandbytes>=0.45.0; platform_system == "Linux"
+torch>=2.6.0; platform_system != "Linux"
+# torch version determined by vllm (pinned by trl[vllm]); do NOT specify here
+
+# OpenEnv
+openenv-core[core]>=0.2.1  # NOT "openenv" (that's an unrelated 2020 package)
+gymnasium>=1.0
+fastapi>=0.104.0
+uvicorn>=0.24.0
+
+# CUDA evaluation (runs on Modal A100, not locally)
+networkx>=3.0              # Reference WCC for PAC verification
+numpy>=1.26
+scipy>=1.12
+
+# Infrastructure
+modal>=0.70                # A100 cloud dispatch (~$3.95/hr)
+wandb>=0.19                # Experiment tracking (optional)
+
+# Demo and visualization
+streamlit>=1.28.0
+plotly>=5.17.0
+pandas>=2.1.0
+
+# GPU-specific dependencies are intentionally omitted from default local installs.
+# Install them in CUDA Linux environments (e.g. Modal image) as needed:
+#   cupy-cuda12x
+#   cugraph
+#   cudf
+
+# Utilities
+tqdm>=4.66.0
+rich>=13.6.0
+click>=8.1.0
+pydantic>=2.4.0
+
+# Development and testing
+pytest>=7.4.0
+pytest-cov>=4.1.0
+black>=23.9.0
+isort>=5.12.0
+flake8>=6.1.0
+mypy>=1.6.0
+
+# Documentation
+mkdocs>=1.5.0
+mkdocs-material>=9.4.0

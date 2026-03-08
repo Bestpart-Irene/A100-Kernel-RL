@@ -1,0 +1,37 @@
+name: Tests
+
+on:
+  push:
+    branches: [main, 'claude/*']
+  pull_request:
+    branches: [main]
+
+jobs:
+  unit-tests:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ['3.10', '3.12']
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        run: uv python install ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: uv sync --extra dev
+
+      - name: Smoke test (no pytest needed)
+        run: uv run python scripts/smoke_test.py
+
+      - name: Unit tests (Tier 0 — pure Python)
+        run: uv run pytest tests/ -m "not slow and not integration and not gpu" -v --tb=short
+
+      - name: Integration tests (Tier 1 — networkx/numpy)
+        run: uv run pytest tests/ -m "slow and not gpu" -v --tb=short
+
+      - name: Coverage report
+        run: uv run pytest tests/ -m "not gpu" --cov=openenv_env --cov=training --cov=verification --cov-report=term-missing

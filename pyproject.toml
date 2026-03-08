@@ -1,0 +1,262 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kernelforge-openenv"
+version = "3.0.0"
+description = "Autonomous H100 CUDA Kernel Generation with Reinforcement Learning"
+readme = "README.md"
+license = {text = "MIT"}
+authors = [
+    {name = "KernelForge Team", email = "team@kernelforge.ai"}
+]
+maintainers = [
+    {name = "KernelForge Team", email = "team@kernelforge.ai"}
+]
+keywords = [
+    "cuda",
+    "gpu",
+    "h100",
+    "reinforcement-learning",
+    "kernel-optimization",
+    "openenv",
+    "pytorch",
+    "nvidia"
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+requires-python = ">=3.10"
+dependencies = [
+    "pydantic>=2.4.0",
+    "numpy>=1.26",
+    "networkx>=3.0",
+    "scipy>=1.12",
+    "tqdm>=4.66.0",
+    "rich>=13.6.0",
+    "click>=8.1.0",
+    "httpx>=0.27",
+]
+
+[project.optional-dependencies]
+train = [
+    # unsloth is NOT listed here — install separately with: pip install --no-deps unsloth unsloth_zoo
+    # This bypasses unsloth's stale trl<=0.24.0 cap (fixed in Dec 2025 release)
+    "trl[vllm]==0.29.0; platform_system == 'Linux'",  # Full training stack on Linux/B200
+    "trl==0.29.0; platform_system != 'Linux'",  # Control-plane install for macOS dev/preflight
+    "transformers>=4.56.2,!=5.0.0,!=5.1.0",
+    "datasets>=3.0",
+    "accelerate>=1.4.0",
+    "peft>=0.17.0",
+    "bitsandbytes>=0.45.0; platform_system == 'Linux'",
+    "torch>=2.6.0; platform_system != 'Linux'",
+    # torch version is determined by vllm (pinned by trl[vllm]); don't specify here
+]
+openenv = [
+    "openenv-core[core]>=0.2.1",
+]
+modal = [
+    "modal>=0.70",
+]
+viz = [
+    "streamlit>=1.28.0",
+    "plotly>=5.17.0",
+    "pandas>=2.1.0",
+]
+dev = [
+    "pytest>=7.4.0",
+    "pytest-cov>=4.1.0",
+    "black>=23.9.0",
+    "isort>=5.12.0",
+    "flake8>=6.1.0",
+    "mypy>=1.6.0",
+    "pre-commit>=3.5.0",
+]
+docs = [
+    "mkdocs>=1.5.0",
+    "mkdocs-material>=9.4.0",
+    "mkdocstrings[python]>=0.23.0",
+]
+profiling = []
+wandb = [
+    "wandb>=0.19",
+]
+all = [
+    "kernelforge-openenv[train,openenv,modal,viz,dev,docs,wandb]",
+]
+
+[tool.uv]
+dev-dependencies = [
+    "modal>=0.70",
+    "streamlit>=1.28.0",
+    "plotly>=5.17.0",
+    "pandas>=2.1.0",
+    "pytest>=7.4.0",
+    "pytest-cov>=4.1.0",
+    "black>=23.9.0",
+    "isort>=5.12.0",
+    "flake8>=6.1.0",
+    "mypy>=1.6.0",
+    "pre-commit>=3.5.0",
+    "wandb>=0.19",
+    "mkdocs>=1.5.0",
+    "mkdocs-material>=9.4.0",
+    "mkdocstrings[python]>=0.23.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/OCWC22/H100-Kernel-RL"
+Documentation = "https://kernelforge.readthedocs.io"
+Repository = "https://github.com/OCWC22/H100-Kernel-RL.git"
+"Bug Tracker" = "https://github.com/OCWC22/H100-Kernel-RL/issues"
+
+[project.scripts]
+kernelforge-train = "training.grpo_train:main"
+kernelforge-demo = "demo.streamlit_demo:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = [
+    "openenv_env*",
+    "training*",
+    "evaluation*",
+    "verification*",
+    "datasets*",
+    "demo*",
+    "kernels*",
+    "eval_service*",
+]
+
+[tool.setuptools.package-data]
+kernelforge = [
+    "*.md",
+    "*.txt",
+    "*.json",
+    "*.jsonl",
+]
+
+[tool.black]
+line-length = 100
+target-version = ['py310', 'py311', 'py312']
+include = '\.pyi?$'
+extend-exclude = '''
+/(
+  # directories
+  \.eggs
+  | \.git
+  | \.hg
+  | \.mypy_cache
+  | \.tox
+  | \.venv
+  | build
+  | dist
+  | outputs
+  | datasets
+)/
+'''
+
+[tool.isort]
+profile = "black"
+line_length = 100
+multi_line_output = 3
+include_trailing_comma = true
+force_grid_wrap = 0
+use_parentheses = true
+ensure_newline_before_comments = true
+
+[tool.mypy]
+python_version = "3.10"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+check_untyped_defs = true
+disallow_untyped_decorators = true
+no_implicit_optional = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+warn_no_return = true
+warn_unreachable = true
+strict_equality = true
+
+[[tool.mypy.overrides]]
+module = [
+    "cupy.*",
+    "cugraph.*",
+    "cudf.*",
+    "modal.*",
+    "unsloth.*",
+    "trl.*",
+    "transformers.*",
+    "networkx.*",
+    "plotly.*",
+    "streamlit.*",
+]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+minversion = "6.0"
+addopts = "-ra -q --strict-markers --strict-config"
+testpaths = [
+    "tests",
+]
+markers = [
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+    "integration: marks tests as integration tests",
+    "gpu: marks tests that require GPU access",
+]
+
+[tool.coverage.run]
+source = ["."]
+omit = [
+    "tests/*",
+    "outputs/*",
+    "datasets/*",
+    "*/__pycache__/*",
+    "*/.*",
+]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "if self.debug:",
+    "if settings.DEBUG",
+    "raise AssertionError",
+    "raise NotImplementedError",
+    "if 0:",
+    "if __name__ == .__main__.:",
+    "class .*\\bProtocol\\):",
+    "@(abc\\.)?abstractmethod",
+]
+
+[tool.flake8]
+max-line-length = 100
+extend-ignore = [
+    "E203",  # whitespace before ':'
+    "E501",  # line too long
+    "W503",  # line break before binary operator
+]
+exclude = [
+    ".git",
+    "__pycache__",
+    "build",
+    "dist",
+    ".eggs",
+    "*.egg-info",
+    ".venv",
+    ".tox",
+    "outputs",
+    "datasets",
+]

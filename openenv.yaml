@@ -1,0 +1,6 @@
+spec_version: 1
+name: kernelforge
+type: space
+runtime: fastapi
+app: openenv_env.server.app:app
+port: 8000

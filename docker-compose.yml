@@ -1,0 +1,100 @@
+version: '3.8'
+
+services:
+  # Main KernelForge application
+  kernelforge:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8501:8501"
+    environment:
+      - PYTHONUNBUFFERED=1
+      - CUDA_VISIBLE_DEVICES=0
+    volumes:
+      - ./outputs:/app/outputs
+      - ./datasets:/app/datasets
+      - ./cache:/app/cache
+    networks:
+      - kernelforge-network
+    profiles:
+      - demo
+      - training
+
+  # OpenEnv HTTP server
+  openenv-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["python", "-m", "uvicorn", "openenv_env.server.app:app", "--host", "0.0.0.0", "--port", "8000"]
+    ports:
+      - "8000:8000"
+    environment:
+      - PYTHONUNBUFFERED=1
+    volumes:
+      - ./outputs:/app/outputs
+      - ./cache:/app/cache
+    networks:
+      - kernelforge-network
+    profiles:
+      - openenv
+
+  # Jupyter notebook for development
+  jupyter:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["python", "-m", "jupyter", "notebook", "--ip=0.0.0.0", "--port=8888", "--no-browser", "--allow-root"]
+    ports:
+      - "8888:8888"
+    environment:
+      - PYTHONUNBUFFERED=1
+      - JUPYTER_ENABLE_LAB=yes
+    volumes:
+      - ./:/app
+      - ./outputs:/app/outputs
+      - ./datasets:/app/datasets
+      - ./cache:/app/cache
+    networks:
+      - kernelforge-network
+    profiles:
+      - dev
+
+  # Monitoring with Prometheus (optional)
+  prometheus:
+    image: prom/prometheus:latest
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+    networks:
+      - kernelforge-network
+    profiles:
+      - monitoring
+
+  # Grafana for visualization (optional)
+  grafana:
+    image: grafana/grafana:latest
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=kernelforge
+    volumes:
+      - grafana-storage:/var/lib/grafana
+      - ./monitoring/grafana:/etc/grafana/provisioning
+    networks:
+      - kernelforge-network
+    profiles:
+      - monitoring
+
+networks:
+  kernelforge-network:
+    driver: bridge
+
+volumes:
+  grafana-storage:
