@@ -1,0 +1,48 @@
+{
+  "models": [
+    {
+      "label": "opus_2b",
+      "model_id": "Jackrong/Qwen3.5-2B-Claude-4.6-Opus-Reasoning-Distilled",
+      "type": "dense",
+      "params_b": 2,
+      "bf16_gb": 4,
+      "enabled": true
+    },
+    {
+      "label": "opus_9b",
+      "model_id": "Jackrong/Qwen3.5-9B-Claude-4.6-Opus-Reasoning-Distilled",
+      "type": "dense",
+      "params_b": 9,
+      "bf16_gb": 18,
+      "enabled": true
+    },
+    {
+      "label": "opus_27b",
+      "model_id": "Jackrong/Qwen3.5-27B-Claude-4.6-Opus-Reasoning-Distilled",
+      "type": "dense",
+      "params_b": 27,
+      "bf16_gb": 55,
+      "enabled": true
+    },
+    {
+      "label": "opus_35b_moe",
+      "model_id": "Jackrong/Qwen3.5-35B-A3B-Claude-4.6-Opus-Reasoning-Distilled",
+      "type": "moe",
+      "params_b": 35,
+      "bf16_gb": 70,
+      "enabled": true
+    },
+    {
+      "label": "coder_30b_moe",
+      "model_id": "Qwen/Qwen3-Coder-30B-A3B-Instruct",
+      "type": "moe",
+      "params_b": 30.5,
+      "bf16_gb": 61,
+      "enabled": true
+    }
+  ],
+  "eval_backend": "coreweave",
+  "target_gpu": "A100",
+  "target_arch": "sm_80",
+  "quant_bits": "auto"
+}

@@ -69,8 +69,16 @@ def run_benchmark(
     baselines_only: bool = False,
     max_tasks: int | None = None,
     quant_bits: int = 0,
+    benchmark: str = "all",
 ):
-    """Run the benchmark and output results."""
+    """Run the benchmark and output results.
+
+    Args:
+        benchmark: Filter tasks by evaluation_backend. Options:
+            "all" — run all evaluable tasks (default)
+            "ops6k" — CUDA Agent Ops-6K tasks only
+            "wcc" — Dr. Kernel WCC graph kernels only
+    """
     from openenv_env.task_pool import TaskPool
     from training.task_support import normalize_task_row
 
@@ -78,6 +86,16 @@ def run_benchmark(
     print(f"Loaded task pool: {pool.summary()}")
 
     tasks = pool.tasks
+
+    # Filter by benchmark suite
+    if benchmark != "all":
+        tasks = [t for t in tasks if t.get("evaluation_backend") == benchmark]
+        print(f"Filtered to benchmark={benchmark}: {len(tasks)} tasks")
+    else:
+        # Exclude unsupported tasks (no evaluator)
+        tasks = [t for t in tasks if t.get("evaluation_backend", "unsupported") != "unsupported"]
+        print(f"Using all evaluable tasks: {len(tasks)} tasks")
+
     if max_tasks:
         tasks = tasks[:max_tasks]
 
@@ -193,6 +211,7 @@ def run_benchmark(
     output = {
         "model": model_name or "none",
         "pool_path": str(pool_path or "default"),
+        "benchmark": benchmark,
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
         "metrics": metrics,
         "results": results,
@@ -298,6 +317,8 @@ def main():
     parser.add_argument("--max-tasks", type=int, default=None)
     parser.add_argument("--quant-bits", type=int, default=0, choices=[0, 4, 8],
                         help="Quantization bits: 0=bf16, 4=NF4, 8=INT8 (recommended)")
+    parser.add_argument("--benchmark", type=str, default="all", choices=["all", "ops6k", "wcc"],
+                        help="Benchmark suite: all, ops6k (CUDA Agent), wcc (Dr. Kernel)")
     args = parser.parse_args()
 
     run_benchmark(
@@ -307,6 +328,7 @@ def main():
         baselines_only=args.baselines_only,
         max_tasks=args.max_tasks,
         quant_bits=args.quant_bits,
+        benchmark=args.benchmark,
     )
 
 
