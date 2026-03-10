@@ -9,129 +9,70 @@ Fix: scale advantages by N/(N-1) after GRPO computes them. This is the TRLOO
 (Turn-level Reinforce Leave-One-Out) correction — mathematically equivalent to
 computing the baseline from the other G-1 samples.
 
-MARS return-to-go was considered but dropped: with outcome-only rewards (no per-turn
-signal), MARS degenerates to standard trajectory-level GRPO (see ALPHXIV analysis).
+Uses vanilla TRL GRPOTrainer (no Unsloth). Unsloth's compiled GRPOTrainer is
+incompatible with PEFT models loaded outside FastLanguageModel.
 """
 from __future__ import annotations
 
+from typing import Any, Union
+
 import torch
-from trl import GRPOTrainer, GRPOConfig
+from trl import GRPOTrainer
 
 
 class TRLOOGRPOTrainer(GRPOTrainer):
     """GRPOTrainer with TRLOO advantage correction.
 
     Drop-in replacement: just swap GRPOTrainer → TRLOOGRPOTrainer.
-    Everything else (reward_funcs, rollout_func, config) stays the same.
+
+    Overrides _generate_and_score_completions (not _compute_advantages,
+    which does not exist in TRL 0.24.0). Advantages are computed inline
+    inside that method, so we scale them after super() returns.
     """
 
     def __init__(self, *args, **kwargs):
+        # Pop rollout_func if passed — vanilla TRL 0.24.0 doesn't support it.
+        kwargs.pop("rollout_func", None)
         super().__init__(*args, **kwargs)
         self._trloo_enabled = True
 
-    def _compute_advantages(self, rewards: torch.Tensor) -> torch.Tensor:
-        """Compute advantages with TRLOO N/(N-1) correction.
-
-        TRL's GRPOTrainer computes advantages as:
-            A_i = (r_i - mean(r)) / (std(r) + eps)
-
-        This includes sample i in its own baseline, causing (1-1/N) gradient shrinkage.
-        We apply the correction after the base computation.
-        """
-        if torch.isnan(rewards).any():
-            return self._compute_masked_advantages(rewards)
-
-        # Let parent compute vanilla GRPO advantages
-        advantages = super()._compute_advantages(rewards)
+    def _generate_and_score_completions(
+        self, inputs: list[dict[str, Union[torch.Tensor, Any]]]
+    ) -> dict[str, Union[torch.Tensor, Any]]:
+        """Generate completions, score them, then apply TRLOO correction."""
+        output = super()._generate_and_score_completions(inputs)
 
         if not self._trloo_enabled:
-            return advantages
+            return output
 
-        # Apply TRLOO correction per group
-        # rewards shape: (batch_size * num_generations,)
-        # Each group of num_generations consecutive entries shares a prompt
+        advantages = output.get("advantages")
+        if advantages is None:
+            return output
+
         G = self.args.num_generations
         if G <= 1:
-            return advantages
+            return output
 
-        scale = G / (G - 1.0)
+        # Handle NaN advantages (from backend errors / masked rewards)
+        if torch.isnan(advantages).any():
+            output["advantages"] = self._trloo_scale_masked(advantages, G)
+        else:
+            scale = G / (G - 1.0)
+            output["advantages"] = advantages * scale
 
-        # Scale all advantages — the N/(N-1) factor is uniform within each group
-        advantages = advantages * scale
+        return output
 
-        return advantages
+    def _trloo_scale_masked(self, advantages: torch.Tensor, G: int) -> torch.Tensor:
+        """Apply TRLOO scaling only to finite advantage values."""
+        scaled = advantages.clone()
+        finite_mask = torch.isfinite(scaled)
 
-    def _compute_masked_advantages(self, rewards: torch.Tensor) -> torch.Tensor:
-        """Compute group-relative advantages while masking NaN rewards."""
-        G = int(self.args.num_generations)
-        if G <= 0 or rewards.numel() % G != 0:
-            raise ValueError(
-                f"Expected rewards shaped as groups of {G}, got tensor with {rewards.numel()} elements."
-            )
+        if finite_mask.any():
+            scale = G / (G - 1.0)
+            scaled[finite_mask] = scaled[finite_mask] * scale
 
-        grouped_rewards = rewards.view(-1, G)
-        grouped_advantages = torch.zeros_like(grouped_rewards)
-        masked_count = int(torch.isnan(grouped_rewards).sum().item())
-        eps = 1e-6
+        nan_count = int((~finite_mask).sum().item())
+        if nan_count:
+            print(f"[trloo] scaled finite advantages, skipped {nan_count} NaN values (G={G})")
 
-        for group_idx in range(grouped_rewards.shape[0]):
-            group = grouped_rewards[group_idx]
-            valid_mask = torch.isfinite(group)
-            valid_count = int(valid_mask.sum().item())
-            if valid_count == 0:
-                continue
-
-            valid_rewards = group[valid_mask]
-            mean = valid_rewards.mean()
-            std = valid_rewards.std(unbiased=False)
-            if float(std.item()) == 0.0:
-                valid_advantages = torch.zeros_like(valid_rewards)
-            else:
-                valid_advantages = (valid_rewards - mean) / (std + eps)
-
-            if self._trloo_enabled and valid_count > 1:
-                valid_advantages = valid_advantages * (valid_count / (valid_count - 1.0))
-
-            grouped_advantages[group_idx, valid_mask] = valid_advantages
-
-        if masked_count:
-            print(
-                f"[trloo] masked_invalid_rewards={masked_count} "
-                f"groups={grouped_rewards.shape[0]} G={G}"
-            )
-
-        return grouped_advantages.view_as(rewards)
-
-
-def create_trloo_trainer(
-    model,
-    tokenizer,
-    reward_funcs,
-    train_dataset,
-    config: GRPOConfig,
-    rollout_func=None,
-) -> TRLOOGRPOTrainer:
-    """Factory function to create a TRLOO-augmented GRPO trainer.
-
-    Args:
-        model: The model to train (with LoRA already applied).
-        tokenizer: The tokenizer / processing_class.
-        reward_funcs: Reward function(s) for GRPO.
-        train_dataset: HF Dataset with 'prompt' column.
-        config: GRPOConfig with training hyperparameters.
-        rollout_func: Optional custom rollout (for multi-turn OpenEnv).
-
-    Returns:
-        TRLOOGRPOTrainer ready to .train()
-    """
-    kwargs = {
-        "model": model,
-        "processing_class": tokenizer,
-        "reward_funcs": reward_funcs,
-        "args": config,
-        "train_dataset": train_dataset,
-    }
-    if rollout_func is not None:
-        kwargs["rollout_func"] = rollout_func
-
-    return TRLOOGRPOTrainer(**kwargs)
+        return scaled

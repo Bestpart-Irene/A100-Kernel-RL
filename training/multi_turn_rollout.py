@@ -246,7 +246,8 @@ def _print_turn_summary(
     print(
         f"[rollout] turn {turn}/{max_turns} mode={mode} active={active_count} "
         f"remote={remote_count} gen={generation_ms:.1f}ms dispatch={dispatch_ms:.1f}ms "
-        f"rewards=[{reward_preview}]"
+        f"rewards=[{reward_preview}]",
+        flush=True,
     )
 
 
@@ -265,7 +266,7 @@ def _generate_rollout_completions_compat(trainer: Any, prompts: list[str]) -> li
 
     results = []
     for prompt_idx, prompt in enumerate(prompts):
-        inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=4096)
+        inputs = tokenizer(text=prompt, return_tensors="pt", truncation=True, max_length=4096)
         input_ids = inputs["input_ids"].to(model.device)
         prompt_ids = input_ids[0].tolist()
 
@@ -322,6 +323,7 @@ def make_multi_turn_rollout(
     prompt_lookup = build_prompt_lookup(problem_metadata or [])
 
     def rollout_func(prompts: list[str], trainer: Any) -> dict:
+        print(f"[rollout] ENTER rollout_func with {len(prompts)} prompts", flush=True)
         tokenizer = trainer.processing_class
         skill_context = build_skill_md(gpu_name)
         task_rows = [
@@ -438,12 +440,13 @@ def make_multi_turn_rollout(
             print(
                 f"[rollout] turn {turn + 1}/{max_turns} starting generation "
                 f"for {len(active_prompts)} prompts "
-                f"(max_completion_length={getattr(trainer.args, 'max_completion_length', '?')})"
+                f"(max_completion_length={getattr(trainer.args, 'max_completion_length', '?')})",
+                flush=True,
             )
             generation_start = perf_counter()
             outputs = generate_rollout_completions(trainer, active_prompts)
             generation_ms = _elapsed_ms(generation_start)
-            print(f"[rollout] turn {turn + 1}/{max_turns} generation complete in {generation_ms:.1f}ms")
+            print(f"[rollout] turn {turn + 1}/{max_turns} generation complete in {generation_ms:.1f}ms", flush=True)
 
             pending_jobs: list[dict[str, Any]] = []
             turn_rewards: list[float | None] = []
@@ -727,7 +730,8 @@ def make_multi_turn_rollout(
                 )
                 print(
                     f"[rollout] diagnostics: valid_fraction={valid_fraction:.2f} "
-                    f"{diag_preview or 'no_events=1'}"
+                    f"{diag_preview or 'no_events=1'}",
+                    flush=True,
                 )
 
                 if not valid_turn_rewards:
@@ -743,7 +747,8 @@ def make_multi_turn_rollout(
                     f"[rollout] reward distribution: mean={r_mean:.2f} std={r_std:.2f} "
                     f"min={r_min:.1f} max={r_max:.1f} "
                     f"positive={r_pos}/{len(valid_turn_rewards)} "
-                    f"turn_total={_elapsed_ms(turn_start):.1f}ms"
+                    f"turn_total={_elapsed_ms(turn_start):.1f}ms",
+                    flush=True,
                 )
                 if r_std == 0.0:
                     print(
@@ -760,13 +765,15 @@ def make_multi_turn_rollout(
                 f"[rollout] complete: terminal_rewards={terminal_rewards} "
                 f"mean={statistics.mean(valid_terminal_rewards):.2f} "
                 f"valid_fraction={valid_fraction:.2f} "
-                f"positive={sum(1 for r in valid_terminal_rewards if r > 0.0)}/{len(valid_terminal_rewards)}"
+                f"positive={sum(1 for r in valid_terminal_rewards if r > 0.0)}/{len(valid_terminal_rewards)}",
+                flush=True,
             )
         else:
             print(
                 f"[rollout] complete: terminal_rewards={terminal_rewards} "
                 f"valid_fraction={valid_fraction:.2f} "
-                "no_learning_step=1 reason=all_terminal_rewards_masked"
+                "no_learning_step=1 reason=all_terminal_rewards_masked",
+                flush=True,
             )
 
         return {

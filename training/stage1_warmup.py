@@ -1,13 +1,12 @@
 """
 Stage 1: GRPO Warm-up — bootstrap CUDA syntax on easy operators.
 
-Multi-turn agentic training via TRL's rollout_func:
-  - 3 turns per episode (model sees errors, iterates)
+Single-turn GRPO using vanilla TRL GRPOTrainer (no Unsloth):
+  - Model generates CUDA kernel completions
+  - Reward function evaluates kernels remotely (compile + correctness)
   - Temperature 1.0 for exploration
   - LR 2e-6 to avoid catastrophic forgetting
   - beta=0.0 (no KL penalty — let model explore freely)
-  - Shared GRPO config with Stage 3: G=8, max_completion_length=1024
-  - vLLM disabled by default for hackathon bring-up (`KERNELFORGE_USE_VLLM=0`)
 
 Dataset: CUDA-Agent-Ops-6K easy operators (single-op subset).
 """
@@ -25,7 +24,6 @@ if sys.platform.startswith("linux"):
     except RuntimeError:
         pass
 
-os.environ.setdefault("UNSLOTH_VLLM_STANDBY", "1")
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 if __package__ in {None, ""}:
@@ -33,13 +31,9 @@ if __package__ in {None, ""}:
     if str(ROOT) not in sys.path:
         sys.path.insert(0, str(ROOT))
 
-# Import unsloth BEFORE trl/transformers so it can patch correctly.
-if sys.platform.startswith("linux"):
-    try:
-        from unsloth import FastLanguageModel, PatchFastRL  # noqa: F401
-    except ImportError:
-        pass
-
+# No Unsloth — use vanilla TRL GRPOTrainer directly.
+# Unsloth's compiled GRPOTrainer is incompatible with PEFT models loaded
+# outside FastLanguageModel (shape mismatches in logprob computation).
 from trl import GRPOConfig
 
 from training.custom_grpo_trainer import TRLOOGRPOTrainer
@@ -50,7 +44,6 @@ from training.grpo_config import (
     validate_shared_grpo_runtime,
 )
 from training.model_loader import load_model_and_tokenizer
-from training.multi_turn_rollout import make_multi_turn_rollout, reward_from_env
 from training.task_support import normalize_task_row
 
 TARGET_GPU = os.getenv("KERNELFORGE_TARGET_GPU", "A100")
@@ -62,8 +55,6 @@ SKIP_BENCHMARK = os.getenv("KERNELFORGE_SKIP_BENCHMARK", "0") == "1"
 DEBUG_TIMINGS = os.getenv("KERNELFORGE_DEBUG_TIMINGS", "0") == "1"
 BATCH_EVAL = os.getenv("KERNELFORGE_BATCH_EVAL", "0") == "1"
 
-# Multi-turn configuration
-MAX_TURNS = int(os.getenv("KERNELFORGE_STAGE1_MAX_TURNS", "3"))
 MAX_STEPS = int(os.getenv("KERNELFORGE_STAGE1_MAX_STEPS", "100"))
 MAX_COMPLETION_LENGTH = GRPO_RUNTIME.max_completion_length
 
@@ -125,12 +116,102 @@ def load_stage1_dataset() -> Dataset:
     ])
 
 
+# --- Reward function ---
+
+
+def make_cuda_reward_func(task_rows: list[dict]):
+    """Create a reward function that evaluates CUDA kernels via remote eval backend."""
+    from training.multi_turn_rollout import extract_cuda_code
+    from training.task_support import (
+        build_prompt_lookup,
+        compute_task_reward,
+        evaluate_code_remote,
+    )
+
+    prompt_lookup = build_prompt_lookup(task_rows)
+
+    def cuda_eval_reward(completions: list[str], prompts: list[str] | None = None, **kwargs) -> list[float]:
+        """Evaluate generated CUDA kernels and return rewards.
+
+        Dense reward ladder (richer gradient signal than flat -1.0):
+          -1.0  no code at all
+          -0.7  truncated (ran out of tokens before completing code)
+          -0.5  code too short to be valid
+          -0.4  remote compile failure
+          -0.2  correctness failure
+          +0.2 to +1.0  correct with varying speedup
+        """
+        rewards = []
+        stats = {"no_code": 0, "truncated": 0, "short": 0, "eval_ok": 0, "error": 0}
+        for i, completion in enumerate(completions):
+            try:
+                cuda_code = extract_cuda_code(completion)
+
+                # Dense reward for different failure modes
+                if not cuda_code:
+                    # Check if truncated (hit max completion length)
+                    if len(completion) >= MAX_COMPLETION_LENGTH - 10:
+                        rewards.append(-0.7)
+                        stats["truncated"] += 1
+                        print(f"  [reward] sample {i}: truncated reward=-0.70", flush=True)
+                    else:
+                        rewards.append(-1.0)
+                        stats["no_code"] += 1
+                        print(f"  [reward] sample {i}: no_code reward=-1.00", flush=True)
+                    continue
+
+                if len(cuda_code.strip()) < 20:
+                    rewards.append(-0.5)
+                    stats["short"] += 1
+                    print(f"  [reward] sample {i}: short_code reward=-0.50", flush=True)
+                    continue
+
+                # Find the matching task row for this prompt
+                prompt = prompts[i] if prompts else ""
+                task_row = normalize_task_row(prompt_lookup.get(prompt, {"prompt": prompt}))
+
+                result = evaluate_code_remote(
+                    cuda_code,
+                    task_row,
+                    skip_benchmark=SKIP_BENCHMARK,
+                    trace_id=f"stage1_step",
+                )
+                reward = compute_task_reward(result)
+                rewards.append(float(reward) if reward is not None else -1.0)
+                stats["eval_ok"] += 1
+                status = "compile" if result.get("compiles") else "fail"
+                if result.get("correct"):
+                    status = "correct"
+                print(f"  [reward] sample {i}: {status} reward={rewards[-1]:.2f}", flush=True)
+            except Exception as e:
+                print(f"  [reward] sample {i}: error={str(e)[:200]}", flush=True)
+                rewards.append(-1.0)
+                stats["error"] += 1
+
+        # Diagnostic summary
+        n = len(rewards)
+        if n > 0:
+            import statistics
+            r_mean = statistics.mean(rewards)
+            r_std = statistics.stdev(rewards) if n > 1 else 0.0
+            print(
+                f"  [reward] batch summary: n={n} mean={r_mean:.3f} std={r_std:.3f} "
+                f"no_code={stats['no_code']} truncated={stats['truncated']} "
+                f"short={stats['short']} eval_ok={stats['eval_ok']} error={stats['error']}",
+                flush=True,
+            )
+            if r_std == 0 and n > 1:
+                print("  [reward] WARNING: zero reward variance — GRPO will produce zero gradients", flush=True)
+        return rewards
+
+    return cuda_eval_reward
+
+
 # --- Training ---
 
 def main():
-    """Run Stage 1 GRPO warm-up with multi-turn agentic loop."""
-    print(f"=== Stage 1: Multi-Turn GRPO Warm-up for {TARGET_GPU} ({TARGET_ARCH}) ===")
-    print(f"  Max turns per episode: {MAX_TURNS}")
+    """Run Stage 1 GRPO warm-up (single-turn, no Unsloth)."""
+    print(f"=== Stage 1: GRPO Warm-up for {TARGET_GPU} ({TARGET_ARCH}) ===")
     print(f"  Max training steps: {MAX_STEPS}")
     print(f"  Max prompt length: {GRPO_RUNTIME.max_prompt_length}")
     print(f"  Max completion length: {MAX_COMPLETION_LENGTH}")
@@ -140,34 +221,28 @@ def main():
         f"batch={GRPO_RUNTIME.per_device_train_batch_size}x{GRPO_RUNTIME.gradient_accumulation_steps} "
         f"(effective={GRPO_RUNTIME.effective_batch_size})"
     )
-    print(
-        "  Rollout mode: "
-        f"skip_benchmark={SKIP_BENCHMARK} batch_eval={BATCH_EVAL} debug_timings={DEBUG_TIMINGS}"
-    )
+    print(f"  Mode: vanilla TRL (no Unsloth), skip_benchmark={SKIP_BENCHMARK}", flush=True)
 
     model, tokenizer = load_model_and_tokenizer()
+
     dataset = load_stage1_dataset()
     task_rows = [normalize_task_row(row) for row in dataset.to_list()]
 
     # Canary: verify raw generation works before entering GRPO.
-    print("[canary] Testing raw model.generate()...")
+    print("[canary] Testing raw model.generate()...", flush=True)
     import torch
-    _canary_inputs = tokenizer("Write a CUDA vector add kernel.", return_tensors="pt").to(model.device)
+    _canary_inputs = tokenizer(text="Write a CUDA vector add kernel.", return_tensors="pt").to(model.device)
     try:
         with torch.no_grad():
             _canary_out = model.generate(
                 **_canary_inputs, max_new_tokens=32, temperature=1.0,
                 do_sample=True, pad_token_id=tokenizer.pad_token_id,
             )
-        print(f"[canary] PASS — {len(_canary_out[0])} tokens generated")
+        print(f"[canary] PASS — {len(_canary_out[0])} tokens generated", flush=True)
     except Exception as e:
         raise RuntimeError(f"Canary generation failed — model cannot generate: {e}") from e
 
-    rollout_func = make_multi_turn_rollout(
-        max_turns=MAX_TURNS,
-        skill_md_gpu=TARGET_GPU.lower(),
-        problem_metadata=task_rows,
-    )
+    reward_func = make_cuda_reward_func(task_rows)
 
     validate_shared_grpo_runtime(GRPO_RUNTIME)
 
@@ -185,6 +260,7 @@ def main():
                 "top_p": 0.95,
                 "repetition_penalty": 1.05,
                 "dataloader_num_workers": 0,
+                "remove_unused_columns": False,
             },
         )
     )
@@ -192,13 +268,12 @@ def main():
     trainer = TRLOOGRPOTrainer(
         model=model,
         processing_class=tokenizer,
-        reward_funcs=[reward_from_env],
-        rollout_func=rollout_func,
+        reward_funcs=[reward_func],
         args=config,
         train_dataset=dataset,
     )
 
-    print("Starting Stage 1 training...")
+    print("Starting Stage 1 training...", flush=True)
     trainer.train()
 
     model.save_pretrained(OUTPUT_DIR)

@@ -1,9 +1,10 @@
 """
-Eval dispatch abstraction — routes to CoreWeave (HTTP) or Modal (serverless).
+Eval dispatch abstraction — routes to local (same-process), Modal, or HTTP.
 
 Set KERNELFORGE_EVAL_BACKEND to control dispatch:
+  - "local": call eval_core functions directly (same GPU, no network)
+  - "modal": modal.Function.from_name().remote() (requires separate deployed app)
   - "coreweave" (default): HTTP POST to KERNELFORGE_EVAL_URL (Northflank endpoint)
-  - "modal": modal.Function.from_name().remote() (requires Modal auth)
 """
 from __future__ import annotations
 
@@ -25,9 +26,40 @@ def dispatch_eval(fn_name: str, payload: dict[str, Any] | None = None) -> dict[s
     Returns:
         Evaluation result dict.
     """
+    if EVAL_BACKEND == "local":
+        return _dispatch_local(fn_name, payload)
     if EVAL_BACKEND == "modal":
         return _dispatch_modal(fn_name, payload)
     return _dispatch_http(fn_name, payload)
+
+
+def _dispatch_local(fn_name: str, payload: dict[str, Any] | None) -> dict[str, Any]:
+    """Dispatch by calling eval_core functions directly (same-process, same GPU)."""
+    import torch
+    from eval_service.eval_core import (
+        evaluate_kernel_impl,
+        evaluate_kernels_batch_impl,
+        evaluate_ops6k_kernel_impl,
+        profile_baselines_impl,
+        test_gpu_features_impl,
+    )
+
+    _LOCAL_DISPATCH = {
+        "evaluate_kernel": evaluate_kernel_impl,
+        "evaluate_ops6k_kernel": evaluate_ops6k_kernel_impl,
+        "evaluate_kernels_batch": evaluate_kernels_batch_impl,
+        "profile_baselines": profile_baselines_impl,
+        "test_gpu_features": test_gpu_features_impl,
+    }
+    fn = _LOCAL_DISPATCH.get(fn_name)
+    if fn is None:
+        raise ValueError(f"Unknown local eval function: {fn_name}")
+    try:
+        if payload is None:
+            return fn()
+        return fn(payload)
+    finally:
+        torch.cuda.empty_cache()
 
 
 def _dispatch_http(fn_name: str, payload: dict[str, Any] | None) -> dict[str, Any]:

@@ -33,12 +33,14 @@ train_image = (
     .pip_install("torch==2.9.0", "torchvision==0.24.0")
     # Xformers as attention backend (flash-attn removed — was broken).
     .pip_install("xformers>=0.0.29")
+    # TODO: install causal-conv1d for fast linear attention (Qwen 3.5 Mamba layers).
+    # Skipped for now — building from source takes too long. Torch fallback works.
     # Unsloth with full deps (caps trl<=0.24.0, datasets<4.4.0).
     .pip_install("unsloth==2026.3.4", "unsloth_zoo")
-    # Training stack pinned to known-working versions.
+    # Training stack — transformers 5.2.0 needed for Qwen 3.5 architecture.
     .pip_install(
         "trl==0.24.0",
-        "transformers==4.57.6",
+        "transformers==5.2.0",
         "datasets>=3.4.1,<4.4.0",
         "accelerate>=1.4.0",
         "peft>=0.18.0",
@@ -47,18 +49,26 @@ train_image = (
         "openenv-core[core]>=0.2.1",
         "numpy>=1.26",
         "httpx>=0.27",
-        "vllm==0.12.0",
         "modal>=0.70",
     )
+    # Local eval backend deps (eval_service/eval_core.py compiles CUDA extensions).
+    .pip_install("cupy-cuda12x", "ninja")
+    # NOTE: vllm removed — requires transformers<5, incompatible with Qwen 3.5.
+    # Stage 1 uses USE_VLLM=0 (compat shim). Re-add when vllm supports transformers 5.x.
     # NO flash-attn — removed until first training step completes cleanly.
     .env({
         "HF_HUB_ENABLE_HF_TRANSFER": "1",
         "TOKENIZERS_PARALLELISM": "false",
         "NCCL_P2P_DISABLE": "1",
+        # Disable torch.compile — Unsloth bug #4025: VLM variable-length sequences
+        # break torch._dynamo shape tracing in chunked_hidden_states_selective_log_softmax.
+        "UNSLOTH_COMPILE_DISABLE": "1",
+        "TORCHDYNAMO_DISABLE": "1",
+        "TORCHINDUCTOR_DISABLE": "1",
     })
     .pip_install("hf_transfer")
     .add_local_python_source(
-        "training", "openenv_env", "evaluation", "verification",
+        "training", "openenv_env", "evaluation", "verification", "eval_service",
     )
     .add_local_dir("configs", remote_path="/root/configs")
     .add_local_dir("datasets", remote_path="/root/datasets")
@@ -111,13 +121,15 @@ def train(
     print(f"VRAM: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
     print(f"CUDA: {torch.version.cuda}")
 
-    os.environ.setdefault("KERNELFORGE_EVAL_BACKEND", "modal")
+    os.environ.setdefault("KERNELFORGE_EVAL_BACKEND", "local")
     os.environ.setdefault("KERNELFORGE_MODAL_APP", EVAL_APP_NAME)
     if model_label:
         os.environ["KERNELFORGE_MODEL_LABEL"] = model_label
     os.environ.setdefault("KERNELFORGE_MODEL_LABEL", "opus_2b")
     os.environ.setdefault("KERNELFORGE_LORA_R", "64")
     os.environ.setdefault("KERNELFORGE_LORA_ALPHA", "64")
+    # Skip Unsloth patching — Qwen 3.5 RoPE bug in unsloth compiled module.
+    os.environ.setdefault("KERNELFORGE_SKIP_UNSLOTH", "1")
     if stage in {0, 1}:
         os.environ.setdefault("KERNELFORGE_SKIP_BENCHMARK", "1")
         os.environ.setdefault("KERNELFORGE_DEBUG_TIMINGS", "1")
@@ -148,8 +160,11 @@ def train(
         os.environ.setdefault("KERNELFORGE_DEBUG_TIMINGS", "1")
         os.environ.setdefault("KERNELFORGE_BATCH_EVAL", "1")
         os.environ.setdefault("KERNELFORGE_STAGE1_MAX_TURNS", "1")
-        os.environ.setdefault("CUDA_AGENT_STAGE1_SAMPLES", "4")
-        os.environ.setdefault("KERNELFORGE_STAGE1_MAX_COMPLETION_LENGTH", "1024")
+        os.environ.setdefault("CUDA_AGENT_STAGE1_SAMPLES", "100")
+        os.environ.setdefault("KERNELFORGE_STAGE1_MAX_COMPLETION_LENGTH", "2048")
+        os.environ.setdefault("KERNELFORGE_STAGE1_NUM_GENERATIONS", "4")
+        os.environ.setdefault("KERNELFORGE_STAGE1_PER_DEVICE_BATCH_SIZE", "1")
+        os.environ.setdefault("KERNELFORGE_STAGE1_GRADIENT_ACCUMULATION_STEPS", "4")
         if max_steps is None:
             os.environ.setdefault("KERNELFORGE_STAGE1_MAX_STEPS", "5")
         print(
@@ -250,7 +265,7 @@ def _smoke_test() -> dict:
         if model is None or tokenizer is None:
             raise RuntimeError("Skipping generation because model loading failed")
         test_prompt = "Write a CUDA vector addition kernel for A100."
-        inputs = tokenizer(test_prompt, return_tensors="pt").to("cuda")
+        inputs = tokenizer(text=test_prompt, return_tensors="pt").to("cuda")
         with torch.no_grad():
             output = model.generate(**inputs, max_new_tokens=64, temperature=0.7, do_sample=True)
         generated = tokenizer.decode(output[0], skip_special_tokens=True)

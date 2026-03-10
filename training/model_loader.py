@@ -155,14 +155,133 @@ def _make_bnb_config(quant_bits: int):
     return None
 
 
-def _load_primary(model_id: str | None = None, quant_bits: int = 0):
-    """Load MoE model via Unsloth FastLanguageModel (supports MoE since 2026)."""
-    from unsloth import FastLanguageModel, PatchFastRL
+SKIP_UNSLOTH = os.getenv("KERNELFORGE_SKIP_UNSLOTH", "0") == "1"
 
+
+def _load_model_hf(model_id: str, quant_bits: int = 0):
+    """Load model via raw Transformers + PEFT (no Unsloth).
+
+    Handles both causal LM and multimodal (ConditionalGeneration) models by
+    auto-detecting the architecture from the model config.
+    """
+    import torch
+    from peft import LoraConfig, TaskType, get_peft_model
+    from transformers import AutoConfig
+
+    hf_model_name = model_id.split("/", 1)[1] if model_id.startswith("unsloth/") else model_id
+    quant_label = {0: "bf16", 4: "4bit", 8: "8bit"}.get(quant_bits, f"{quant_bits}bit")
+    print(f"Loading model via Transformers + PEFT: {hf_model_name} ({quant_label})")
+
+    # Detect model architecture to choose the right Auto class
+    config = AutoConfig.from_pretrained(hf_model_name, trust_remote_code=True)
+    arch = (config.architectures or [""])[0] if hasattr(config, "architectures") else ""
+    is_multimodal = "ConditionalGeneration" in arch or "Vision2Seq" in arch
+    print(f"  Architecture: {arch} (multimodal={is_multimodal})")
+
+    # Always use AutoTokenizer, even for multimodal models. AutoProcessor wraps
+    # tokenizer + image processor with an incompatible API (no .pad_token_id,
+    # .decode(), different __call__ signature). For text-only CUDA kernel
+    # generation, we only need the tokenizer component.
+    from transformers import AutoTokenizer
+    tokenizer = AutoTokenizer.from_pretrained(hf_model_name, trust_remote_code=True)
+    if is_multimodal:
+        print(f"  Multimodal model detected ({arch}), using text-only tokenizer")
+
+    if tokenizer.pad_token is None and tokenizer.eos_token is not None:
+        tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = "left"
+
+    # Load model with the right class
+    load_kwargs: dict = {
+        "trust_remote_code": True,
+        "torch_dtype": torch.bfloat16,
+        "device_map": "auto",
+    }
+    bnb_config = _make_bnb_config(quant_bits)
+    if bnb_config is not None:
+        load_kwargs["quantization_config"] = bnb_config
+        print(f"  Using {quant_label} quantization via BitsAndBytes")
+
+    if is_multimodal:
+        import gc
+        import transformers
+        from transformers import PreTrainedModel
+        model_class = getattr(transformers, arch, None)
+        if model_class is None:
+            from transformers import AutoModelForVision2Seq
+            model_class = AutoModelForVision2Seq
+        full_model = model_class.from_pretrained(hf_model_name, **load_kwargs)
+        # Extract CausalLM from VLM for text-only GRPO training.
+        # VLM wrappers have model.model.language_model + model.model.visual,
+        # but GRPO needs a standard CausalLM (model.model=TextModel, model.lm_head=Linear).
+        causal_arch = arch.replace("ForConditionalGeneration", "ForCausalLM")
+        causal_class = getattr(transformers, causal_arch, None)
+        if causal_class is not None and hasattr(full_model, "model") and hasattr(full_model.model, "language_model"):
+            text_config = config.text_config if hasattr(config, "text_config") else config
+            # Construct a proper CausalLM with full __init__, then transplant
+            # the trained weights from the VLM. This ensures all attributes
+            # expected by TRL/PEFT (warnings_issued, etc.) are properly set up.
+            causal_model = causal_class(text_config)
+            causal_model.generation_config = full_model.generation_config
+            causal_model.model = full_model.model.language_model
+            causal_model.lm_head = full_model.lm_head
+            causal_model.vocab_size = text_config.vocab_size
+            print(f"  Extracted {causal_arch} from VLM for text-only GRPO training")
+            del full_model
+            gc.collect()
+            torch.cuda.empty_cache()
+            model = causal_model
+        else:
+            print(f"  WARNING: Could not extract CausalLM from {arch}, using full VLM")
+            model = full_model
+    else:
+        from transformers import AutoModelForCausalLM
+        model = AutoModelForCausalLM.from_pretrained(hf_model_name, **load_kwargs)
+
+    # Ensure warnings_issued exists — TRL 0.24.0 expects it (grpo_trainer.py:406)
+    # but transformers 5.x removed it from PreTrainedModel.__init__.
+    if not hasattr(model, "warnings_issued"):
+        model.warnings_issued = {}
+
+    if hasattr(model, "gradient_checkpointing_enable"):
+        model.gradient_checkpointing_enable()
+    if hasattr(model, "enable_input_require_grads"):
+        model.enable_input_require_grads()
+
+    model = get_peft_model(
+        model,
+        LoraConfig(
+            task_type=TaskType.CAUSAL_LM,
+            inference_mode=False,
+            r=LORA_R,
+            lora_alpha=LORA_ALPHA,
+            lora_dropout=LORA_DROPOUT,
+            target_modules=LORA_TARGETS,
+            bias="none",
+        ),
+    )
+
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    total = sum(p.numel() for p in model.parameters())
+    print(
+        f"Model loaded via Transformers + PEFT from {hf_model_name}: "
+        f"{trainable:,} trainable / {total:,} total params ({trainable / total * 100:.2f}%)"
+    )
+    return model, tokenizer
+
+
+def _load_primary(model_id: str | None = None, quant_bits: int = 0):
+    """Load model via Unsloth FastLanguageModel, falling back to raw HF."""
     effective_model = model_id
     if not effective_model:
         raise ValueError("model_id must be provided; model selection is registry-driven.")
     quant_label = {0: "bf16", 4: "4bit", 8: "8bit"}.get(quant_bits, f"{quant_bits}bit")
+
+    if SKIP_UNSLOTH:
+        print("KERNELFORGE_SKIP_UNSLOTH=1 — skipping Unsloth, loading via Transformers + PEFT")
+        return _load_model_hf(effective_model, quant_bits)
+
+    from unsloth import FastLanguageModel, PatchFastRL
 
     candidates: list[str] = []
     unsloth_alias = (
@@ -213,55 +332,7 @@ def _load_primary(model_id: str | None = None, quant_bits: int = 0):
             print(f"Selected model load failed for {candidate}: {str(exc)[:500]}")
 
     print("Falling back to Transformers + PEFT for the same selected model")
-    import torch
-    from peft import LoraConfig, TaskType, get_peft_model
-    from transformers import AutoModelForCausalLM, AutoTokenizer
-
-    hf_model_name = effective_model.split("/", 1)[1] if effective_model.startswith("unsloth/") else effective_model
-    tokenizer = AutoTokenizer.from_pretrained(hf_model_name, trust_remote_code=True)
-    if tokenizer.pad_token is None and tokenizer.eos_token is not None:
-        tokenizer.pad_token = tokenizer.eos_token
-    tokenizer.padding_side = "left"
-
-    load_kwargs: dict = {
-        "trust_remote_code": True,
-        "torch_dtype": torch.bfloat16,
-        "device_map": "auto",
-    }
-    bnb_config = _make_bnb_config(quant_bits)
-    if bnb_config is not None:
-        load_kwargs["quantization_config"] = bnb_config
-        print(f"  Using {quant_label} quantization via BitsAndBytes")
-
-    model = AutoModelForCausalLM.from_pretrained(
-        hf_model_name,
-        **load_kwargs,
-    )
-    if hasattr(model, "gradient_checkpointing_enable"):
-        model.gradient_checkpointing_enable()
-    if hasattr(model, "enable_input_require_grads"):
-        model.enable_input_require_grads()
-
-    model = get_peft_model(
-        model,
-        LoraConfig(
-            task_type=TaskType.CAUSAL_LM,
-            inference_mode=False,
-            r=LORA_R,
-            lora_alpha=LORA_ALPHA,
-            lora_dropout=LORA_DROPOUT,
-            target_modules=LORA_TARGETS,
-            bias="none",
-        ),
-    )
-
-    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    total = sum(p.numel() for p in model.parameters())
-    print(
-        f"Selected model loaded via Transformers + PEFT from {hf_model_name}: "
-        f"{trainable:,} trainable / {total:,} total params ({trainable / total * 100:.2f}%)"
-    )
-    return model, tokenizer
+    return _load_model_hf(effective_model, quant_bits)
 
 
 def _load_selected_model_portable(model_id: str, quant_bits: int = 0):
