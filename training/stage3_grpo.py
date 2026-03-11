@@ -50,7 +50,7 @@ from training.task_support import normalize_task_row
 
 TARGET_GPU = os.getenv("KERNELFORGE_TARGET_GPU", "A100")
 TARGET_ARCH = os.getenv("KERNELFORGE_TARGET_ARCH", "sm_80")
-EVAL_BACKEND = os.getenv("KERNELFORGE_EVAL_BACKEND", "coreweave")
+EVAL_BACKEND = os.getenv("KERNELFORGE_EVAL_BACKEND", "modal")
 STAGE2_OUTPUT = os.getenv("KERNELFORGE_STAGE2_OUTPUT", "outputs/kernelforge-stage2")
 STAGE1_OUTPUT = os.getenv("KERNELFORGE_STAGE1_OUTPUT", "outputs/kernelforge-stage1")
 OUTPUT_DIR = os.getenv("KERNELFORGE_STAGE3_OUTPUT", "outputs/kernelforge-stage3")

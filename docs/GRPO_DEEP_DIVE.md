@@ -1,33 +1,33 @@
 # KernelForge GRPO Deep Dive
-## Hackathon Path: Structured Priors + H200 Training + A100 Evaluation
+## Hackathon Path: Structured Priors + A100 Training + A100 Evaluation
 **Purpose:** Explain the RL strategy that actually fits the hackathon.
-**Primary hardware:** H200 ($4.54/hr, 141GB) for training, A100 80GB for evaluation
-**Primary model:** Qwen3-Coder-30B-A3B-Instruct (30.5B total, 3.3B active, 128 experts / 8 active, 256K context)
-**Last Updated:** March 7, 2026
+**Primary hardware:** A100 80GB for training and evaluation
+**Primary model:** Qwen3.5-2B-Claude-4.6-Opus-Reasoning-Distilled
+**Last Updated:** March 10, 2026
 
 > **IMPORTANT — Hackathon-Scoped GRPO Strategy (March 2026)**
 >
 > This document is no longer centered on B200 as the default, Qwen3-Coder-Next 80B as the default, or full CUDA-Agent-scale replication as the immediate goal.
 >
 > This document is now centered on the actual hackathon path:
-> 1. **Use Qwen3-Coder-30B-A3B-Instruct as the primary model.**
-> 2. **Use H200 for training and A100 80GB for evaluation.**
+> 1. **Use the PRD-aligned A100 runtime path as the default implementation target.**
+> 2. **Use A100 80GB for both training and reward-bearing evaluation.**
 > 3. **Use DoubleGraph, `skills.md`, and curated CUDA-Agent-style tasks as structured priors before RL begins.**
 > 4. **Use SFT first, then a small-budget GRPO pilot.**
 > 5. **Treat deeper multi-turn / larger-model / B200 work as future scale-up.**
 >
 > The goal this weekend is to prove: the reward is real, correctness is real, timing is real, structured priors make the search space manageable, the model can improve candidates under this loop, and the pipeline is reusable later. Not to claim full CUDA-Agent parity. Sources: [CUDA-Agent paper](https://arxiv.org/abs/2602.24286), [CUDA-Agent project page](https://cuda-agent.github.io/), [doubleGraph repo](https://github.com/double-ai/doubleGraph), [OpenEnv docs](https://meta-pytorch.github.io/OpenEnv/).
 >
-> **Key technique:** TRLOO N/(N-1) correction (Dr. Kernel arXiv [2602.05885](https://arxiv.org/abs/2602.05885)) fixes the self-inclusion bias in GRPO's advantage estimation. With G=2, this corrects 50% gradient shrinkage. Implemented in `custom_grpo_trainer.py`.
+> **Key technique:** TRLOO N/(N-1) correction (Dr. Kernel arXiv [2602.05885](https://arxiv.org/abs/2602.05885)) fixes the self-inclusion bias in GRPO's advantage estimation. With small `G`, this corrects gradient shrinkage. Implemented in `custom_grpo_trainer.py`.
 
 ## Core Recommendation
 
 ### Hackathon recommendation
 - **Start from structured priors**, then do SFT warmup, then GRPO pilot, then search / best-of-N as a hedge
-- Model: Qwen3-Coder-30B-A3B-Instruct on H200
-- Eval: A100 80GB via the active remote backend target (Northflank + CoreWeave), with the current Modal path treated as legacy transition code
+- Model: Qwen3.5-2B-Claude-4.6-Opus-Reasoning-Distilled on A100 80GB
+- Eval: A100 80GB via the active Modal path, with `local` used for smoke checks and HTTP backends treated as optional
 - Priors: DoubleGraph kernels + `skills.md` + curated CUDA-Agent-style tasks
-- G=2, short context, discrete milestone reward {-1, 1, 2, 3}, execution-based correctness, limited-step run with hard abort gates
+- G=8, `max_completion_length=1024`, discrete milestone reward {-1, 1, 2, 3}, execution-based correctness, limited-step run with hard abort gates
 - Because under a hackathon budget, the highest-leverage thing is not elegant RL theory — it is working reward plumbing, working correctness checks, working timing on the actual target hardware, and enough prior structure that RL steps are not mostly wasted.
 
 ### Not recommended as the primary hackathon path
@@ -45,7 +45,7 @@
 That is enough for the hackathon. Not full benchmark domination.
 
 ### Locked framing for the rest of this document
-The sections below are primarily **reference material** for implementation and mathematical justification. They are not a commitment to every advanced technique discussed later in the file. The active hackathon scope is the narrower path defined above and in `docs/KERNELFORGE_FINAL_PRD.md`.
+The sections below are primarily **reference material** for implementation and mathematical justification. They are not a commitment to every advanced technique discussed later in the file, and any stale larger-model or H200 references should be read as historical background rather than the active runtime plan. The active hackathon scope is the narrower path defined above and in `docs/KERNELFORGE_FINAL_PRD.md`.
 
 ---
 
@@ -53,7 +53,7 @@ The sections below are primarily **reference material** for implementation and m
 
 This section explains **everything from first principles**, as if you have never seen RL before. No assumptions. Every equation is derived step-by-step with intuition, a simple numerical example, the thought process behind why people invented it, the exact problem it solves (or fails to solve), and how the 2026 papers (real ones like arXiv 2601.08521 "Your Group-Relative Advantage Is Biased" and analogs to Dr. Kernel/TRLOO) fix it.
 
-This is tailored to **your exact use-case**: training Qwen3-Coder-30B-A3B-Instruct on H200 to write A100 CUDA kernels using the CUDA-Agent eval pipeline (compile → verify → profile). The rewards are sparse (most kernels don't compile or are slow), which is exactly why the hackathon path starts by narrowing the search with DoubleGraph, `skills.md`, and curated CUDA-Agent-style tasks before attempting RL.
+This is tailored to **your exact use-case**: training the PRD-aligned A100 runtime path to write A100 CUDA kernels using the CUDA-Agent eval pipeline (compile → verify → profile). The rewards are sparse (most kernels don't compile or are slow), which is exactly why the hackathon path starts by narrowing the search with DoubleGraph, `skills.md`, and curated CUDA-Agent-style tasks before attempting RL.
 
 ### 1. RL Basics – Why We Even Need "Advantage" (First Principles)
 

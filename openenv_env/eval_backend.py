@@ -4,14 +4,14 @@ Eval dispatch abstraction — routes to local (same-process), Modal, or HTTP.
 Set KERNELFORGE_EVAL_BACKEND to control dispatch:
   - "local": call eval_core functions directly (same GPU, no network)
   - "modal": modal.Function.from_name().remote() (requires separate deployed app)
-  - "coreweave" (default): HTTP POST to KERNELFORGE_EVAL_URL (Northflank endpoint)
+  - "coreweave": HTTP POST to KERNELFORGE_EVAL_URL (Northflank endpoint)
 """
 from __future__ import annotations
 
 import os
 from typing import Any
 
-EVAL_BACKEND = os.getenv("KERNELFORGE_EVAL_BACKEND", "coreweave")
+EVAL_BACKEND = os.getenv("KERNELFORGE_EVAL_BACKEND", "modal")
 EVAL_URL = os.getenv("KERNELFORGE_EVAL_URL", "")
 MODAL_APP_NAME = os.getenv("KERNELFORGE_MODAL_APP", "kernelforge-a100")
 

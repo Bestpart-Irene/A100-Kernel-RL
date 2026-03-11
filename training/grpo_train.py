@@ -61,7 +61,7 @@ def preflight() -> None:
         missing_str = ", ".join(missing)
         raise RuntimeError(
             "Missing required training dependencies: "
-            f"{missing_str}. Install them with `uv sync --extra train --extra openenv` for the primary CoreWeave/Northflank path, and add `--extra modal` only if you need the Modal fallback tooling."
+            f"{missing_str}. Install them with `uv sync --extra train --extra openenv --extra modal` for the primary A100/Modal path, or use `uv sync --extra train --extra openenv` if you only need local control-plane preflight tooling."
         )
 
     missing_assets = _missing_assets()

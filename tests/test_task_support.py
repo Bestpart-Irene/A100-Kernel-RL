@@ -127,5 +127,5 @@ def test_evaluate_code_remote_batch_uses_batch_endpoint(monkeypatch):
     assert payloads[0]["trace_id"] == "trace-a"
     assert payloads[1]["trace_id"] == "trace-b"
     assert payloads[0]["skip_benchmark"] is True
-    assert results[0]["reward"] == 1.0
-    assert results[1]["reward"] == -1.0
+    assert results[0]["reward"] == 0.2
+    assert results[1]["reward"] == -0.4

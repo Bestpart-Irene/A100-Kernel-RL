@@ -15,7 +15,7 @@ Pipeline stages:
     4. Evaluation         (evaluation/compare_stages.py)
 
 Training runs locally through the Python entrypoints. Remote evaluation is selected by
-KERNELFORGE_EVAL_BACKEND (CoreWeave/Northflank by default, Modal fallback).
+KERNELFORGE_EVAL_BACKEND (Modal by default, CoreWeave/Northflank optional).
 """
 from __future__ import annotations
 
@@ -30,7 +30,7 @@ import time
 
 TARGET_GPU = os.getenv("KERNELFORGE_TARGET_GPU", "A100")
 TARGET_ARCH = os.getenv("KERNELFORGE_TARGET_ARCH", "sm_80")
-EVAL_BACKEND = os.getenv("KERNELFORGE_EVAL_BACKEND", "coreweave")
+EVAL_BACKEND = os.getenv("KERNELFORGE_EVAL_BACKEND", "modal")
 MODAL_APP = os.getenv("KERNELFORGE_MODAL_APP", "kernelforge-a100")
 EVAL_URL = os.getenv("KERNELFORGE_EVAL_URL", "")
 

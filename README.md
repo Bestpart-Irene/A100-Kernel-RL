@@ -4,10 +4,10 @@ KernelForge is a CUDA-kernel RL repo built around a **custom lightweight OpenEnv
 
 The current hackathon posture is:
 
-- **Training** on H200-class hardware
-- **Reward-bearing eval** on A100
-- **Primary backend**: Northflank-managed CoreWeave service
-- **Fallback backend**: Modal
+- **Training** on A100 80GB
+- **Reward-bearing eval** on A100 80GB
+- **Active backend**: Modal for cloud bring-up, `local` for same-process smoke checks
+- **Optional backend**: CoreWeave/Northflank HTTP service when explicitly configured
 
 References:
 - [OpenEnv overview](https://meta-pytorch.github.io/OpenEnv/)
@@ -36,23 +36,29 @@ KernelForge should be understood as three layers:
 3. **KernelGYM-style execution backend**
    - `openenv_env/eval_backend.py` — backend switch
    - `eval_service/eval_core.py` — shared pure evaluator core
-   - `eval_service/app.py` — Northflank/CoreWeave FastAPI eval service
-   - `modal_app.py` — Modal fallback wrapper
+   - `modal_app.py` — Modal A100 evaluation path
+   - `eval_service/app.py` — optional Northflank/CoreWeave FastAPI eval service
 
 ## Current Backend Selection
 
 The active evaluator is controlled by environment variables:
 
 ```bash
-KERNELFORGE_EVAL_BACKEND=coreweave
-KERNELFORGE_EVAL_URL=https://your-northflank-service
-```
-
-Fallback:
-
-```bash
 KERNELFORGE_EVAL_BACKEND=modal
 KERNELFORGE_MODAL_APP=kernelforge-a100
+```
+
+Smoke-test / same-process fallback:
+
+```bash
+KERNELFORGE_EVAL_BACKEND=local
+```
+
+Optional HTTP backend:
+
+```bash
+KERNELFORGE_EVAL_BACKEND=coreweave
+KERNELFORGE_EVAL_URL=https://your-northflank-service
 ```
 
 ## What Is Implemented in Code
@@ -73,10 +79,10 @@ Internal source-of-truth docs:
 
 ## What Still Needs Live Validation
 
-- live deployment of the CoreWeave/Northflank A100 eval service
-- end-to-end Stage 1 run on the primary backend
-- end-to-end Stage 3 GRPO pilot on the primary backend
-- throughput / stability measurements for the remote eval service
+- end-to-end Stage 1 run on Modal A100
+- end-to-end Stage 2 RFT/SFT continuation from a real Stage 1 checkpoint
+- end-to-end Stage 3 GRPO pilot on Modal A100
+- throughput / stability measurements for the optional HTTP eval service
 
 ## Quick Start
 
@@ -106,8 +112,8 @@ This follows the standard OpenEnv local server pattern documented in the OpenEnv
 Primary hackathon path:
 
 ```bash
-export KERNELFORGE_EVAL_BACKEND=coreweave
-export KERNELFORGE_EVAL_URL=https://your-northflank-service
+export KERNELFORGE_EVAL_BACKEND=modal
+export KERNELFORGE_MODAL_APP=kernelforge-a100
 uv run python -m training.grpo_train --preflight-only
 ```
 
@@ -125,7 +131,17 @@ uv run python -m training.grpo_train --stage stage3
 modal deploy modal_app.py
 modal run modal_train.py --stage 0
 modal run modal_train.py --stage 1
+modal run modal_train.py --stage 2
+modal run modal_train.py --stage 3
 ```
+
+Legacy experimental files remain in the repo for reference, but they are not part of the default path:
+
+- `training/stage0_sft.py`
+- `training/stage1_enhanced_grpo.py`
+- `training/test_sft_model.py`
+- `scripts/run_full_pipeline.py`
+- `docs/OPTIMIZATION_PLAN.md`
 
 ## OpenEnv + GRPO Integration
 
@@ -135,7 +151,7 @@ KernelForge uses the OpenEnv-compatible environment surface for standards compat
 ## Docs Map
 
 - [`docs/KERNELFORGE_FINAL_PRD.md`](docs/KERNELFORGE_FINAL_PRD.md) — architecture, rollout order, launch criteria
-- [`docs/GRPO_DEEP_DIVE.md`](docs/GRPO_DEEP_DIVE.md) — GRPO/TRLOO strategy and rollout details
+- [`docs/GRPO_DEEP_DIVE.md`](docs/GRPO_DEEP_DIVE.md) — GRPO/TRLOO strategy and rollout details aligned to the PRD runtime path
 - [`docs/OPENENV_AUDIT_PLAN_3.md`](docs/OPENENV_AUDIT_PLAN_3.md) — OpenEnv contract review and architecture audit
 - [`docs/skills/CUDA_AGENT.md`](docs/skills/CUDA_AGENT.md) — CUDA-Agent prior
 - [`docs/skills/DOUBLEGRAPH_A100.md`](docs/skills/DOUBLEGRAPH_A100.md) — DoubleGraph A100 prior

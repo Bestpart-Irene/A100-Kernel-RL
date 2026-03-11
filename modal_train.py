@@ -161,10 +161,10 @@ def train(
         os.environ.setdefault("KERNELFORGE_BATCH_EVAL", "1")
         os.environ.setdefault("KERNELFORGE_STAGE1_MAX_TURNS", "1")
         os.environ.setdefault("CUDA_AGENT_STAGE1_SAMPLES", "100")
-        os.environ.setdefault("KERNELFORGE_STAGE1_MAX_COMPLETION_LENGTH", "2048")
+        os.environ.setdefault("KERNELFORGE_STAGE1_MAX_COMPLETION_LENGTH", "1024")
         os.environ.setdefault("KERNELFORGE_STAGE1_NUM_GENERATIONS", "4")
-        os.environ.setdefault("KERNELFORGE_STAGE1_PER_DEVICE_BATCH_SIZE", "1")
-        os.environ.setdefault("KERNELFORGE_STAGE1_GRADIENT_ACCUMULATION_STEPS", "4")
+        os.environ.setdefault("KERNELFORGE_STAGE1_PER_DEVICE_BATCH_SIZE", "4")
+        os.environ.setdefault("KERNELFORGE_STAGE1_GRADIENT_ACCUMULATION_STEPS", "1")
         if max_steps is None:
             os.environ.setdefault("KERNELFORGE_STAGE1_MAX_STEPS", "5")
         print(
