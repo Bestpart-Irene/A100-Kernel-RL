@@ -34,7 +34,8 @@ train_image = (
     # Xformers as attention backend (flash-attn removed — was broken).
     .pip_install("xformers>=0.0.29")
     # Fast linear attention for Qwen 3.5 Mamba-style layers (replaces pure PyTorch fallback).
-    .pip_install("causal-conv1d>=1.4.0")
+    # Best-effort: no pre-built wheel for CUDA 12.4 + torch 2.9, falls back to PyTorch if missing.
+    .run_commands("pip install causal-conv1d>=1.4.0 || echo 'causal-conv1d build failed, using PyTorch fallback'")
     # Unsloth with full deps (caps trl<=0.24.0, datasets<4.4.0).
     .pip_install("unsloth==2026.3.4", "unsloth_zoo")
     # Training stack — transformers 5.2.0 needed for Qwen 3.5 architecture.
