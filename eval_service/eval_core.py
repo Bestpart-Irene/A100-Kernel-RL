@@ -365,6 +365,12 @@ def _benchmark_kernel_source(
 
 def _generate_binding_cpp(cuda_code: str) -> str:
     """Generate a minimal PyTorch C++ binding for a CUDA kernel."""
+    # Handle case where cuda_code might be a list or dict
+    if isinstance(cuda_code, list):
+        cuda_code = str(cuda_code)
+    elif isinstance(cuda_code, dict):
+        cuda_code = cuda_code.get("content", str(cuda_code))
+    
     global_fns = re.findall(
         r'__global__\s+void\s+(\w+)\s*\(([^)]*)\)', cuda_code
     )

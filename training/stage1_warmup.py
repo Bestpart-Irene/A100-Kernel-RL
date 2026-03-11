@@ -151,7 +151,21 @@ def make_cuda_reward_func(task_rows: list[dict]):
 
     prompt_lookup = build_prompt_lookup(task_rows)
 
-    def cuda_eval_reward(completions: list[str], prompts: list[str] | None = None, **kwargs) -> list[float]:
+    def _to_text(value) -> str:
+        """Extract text from TRL completion/prompt (may be str, list of dicts, or dict)."""
+        if isinstance(value, str):
+            return value
+        if isinstance(value, list):
+            # Chat format: [{"role": "assistant", "content": "..."}, ...]
+            for msg in reversed(value):
+                if isinstance(msg, dict) and msg.get("content"):
+                    return msg["content"]
+            return ""
+        if isinstance(value, dict):
+            return value.get("content", "")
+        return str(value)
+
+    def cuda_eval_reward(completions, prompts=None, **kwargs) -> list[float]:
         """Evaluate generated CUDA kernels and return rewards.
 
         Dense reward ladder (richer gradient signal than flat -1.0):
@@ -166,12 +180,13 @@ def make_cuda_reward_func(task_rows: list[dict]):
         stats = {"no_code": 0, "truncated": 0, "short": 0, "eval_ok": 0, "error": 0}
         for i, completion in enumerate(completions):
             try:
-                cuda_code = extract_cuda_code(completion)
+                completion_text = _to_text(completion)
+                cuda_code = extract_cuda_code(completion_text)
 
                 # Dense reward for different failure modes
                 if not cuda_code:
                     # Check if truncated (hit max completion length)
-                    if len(completion) >= MAX_COMPLETION_LENGTH - 10:
+                    if len(completion_text) >= MAX_COMPLETION_LENGTH - 10:
                         rewards.append(-0.7)
                         stats["truncated"] += 1
                         print(f"  [reward] sample {i}: truncated reward=-0.70", flush=True)
@@ -188,8 +203,9 @@ def make_cuda_reward_func(task_rows: list[dict]):
                     continue
 
                 # Find the matching task row for this prompt
-                prompt = prompts[i] if prompts else ""
-                task_row = normalize_task_row(prompt_lookup.get(prompt, {"prompt": prompt}))
+                prompt_raw = prompts[i] if prompts else ""
+                prompt_text = _to_text(prompt_raw)
+                task_row = normalize_task_row(prompt_lookup.get(prompt_text, {"prompt": prompt_text}))
 
                 result = evaluate_code_remote(
                     cuda_code,
