@@ -205,10 +205,19 @@ def make_cuda_reward_func(task_rows: list[dict]):
                     continue
 
                 # Find the matching task row for this prompt
-                # normalize_task_row keys on str(prompt), so match using str() for chat-format lists
+                # Handle both string prompts and chat format lists
                 prompt_raw = prompts[i] if prompts else ""
-                prompt_key = str(prompt_raw).strip()
-                task_row = normalize_task_row(prompt_lookup.get(prompt_key, {"prompt": _to_text(prompt_raw)}))
+                prompt_text = _to_text(prompt_raw)  # Extract text from chat format if needed
+                
+                # Try direct prompt key first, then try extracted text
+                task_row = prompt_lookup.get(str(prompt_raw).strip())
+                if task_row is None:
+                    task_row = prompt_lookup.get(prompt_text.strip())
+                if task_row is None:
+                    # Create fallback with minimal metadata
+                    task_row = {"prompt": prompt_text}
+                
+                task_row = normalize_task_row(task_row)
 
                 result = evaluate_code_remote(
                     cuda_code,
