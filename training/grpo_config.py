@@ -16,6 +16,7 @@ class SharedGRPORuntime:
     gradient_accumulation_steps: int
     optim: str
     bf16: bool
+    fp16: bool
     use_vllm: bool
     vllm_mode: str
     vllm_server_base_url: str
@@ -36,6 +37,9 @@ def load_shared_grpo_runtime(stage: str) -> SharedGRPORuntime:
     """Load shared GRPO settings with stage-specific overrides."""
     is_linux = sys.platform.startswith("linux")
     use_vllm = os.getenv("KERNELFORGE_USE_VLLM", "0") == "1" and is_linux
+    # FP16 has 10 mantissa bits (vs BF16's 7), reducing rounding errors that cause
+    # mid-training reward collapses. A100 delivers identical TFLOPs for both.
+    use_fp16 = os.getenv("KERNELFORGE_USE_FP16", "0") == "1"
 
     return SharedGRPORuntime(
         stage=stage,
@@ -45,7 +49,8 @@ def load_shared_grpo_runtime(stage: str) -> SharedGRPORuntime:
         per_device_train_batch_size=_get_stage_env_int(stage, "PER_DEVICE_BATCH_SIZE", 1),
         gradient_accumulation_steps=_get_stage_env_int(stage, "GRADIENT_ACCUMULATION_STEPS", 8),
         optim="paged_adamw_8bit" if is_linux else "adamw_torch",
-        bf16=is_linux,
+        bf16=is_linux and not use_fp16,
+        fp16=is_linux and use_fp16,
         use_vllm=use_vllm,
         vllm_mode=os.getenv("KERNELFORGE_VLLM_MODE", "server").strip().lower(),
         vllm_server_base_url=os.getenv("KERNELFORGE_VLLM_SERVER_BASE_URL", "").strip(),
@@ -84,6 +89,7 @@ def apply_shared_grpo_runtime(
             "gradient_accumulation_steps": runtime.gradient_accumulation_steps,
             "optim": runtime.optim,
             "bf16": runtime.bf16,
+            "fp16": runtime.fp16,
         }
     )
     if runtime.use_vllm:

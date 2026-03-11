@@ -33,8 +33,8 @@ train_image = (
     .pip_install("torch==2.9.0", "torchvision==0.24.0")
     # Xformers as attention backend (flash-attn removed — was broken).
     .pip_install("xformers>=0.0.29")
-    # TODO: install causal-conv1d for fast linear attention (Qwen 3.5 Mamba layers).
-    # Skipped for now — building from source takes too long. Torch fallback works.
+    # Fast linear attention for Qwen 3.5 Mamba-style layers (replaces pure PyTorch fallback).
+    .pip_install("causal-conv1d>=1.4.0")
     # Unsloth with full deps (caps trl<=0.24.0, datasets<4.4.0).
     .pip_install("unsloth==2026.3.4", "unsloth_zoo")
     # Training stack — transformers 5.2.0 needed for Qwen 3.5 architecture.
@@ -121,15 +121,18 @@ def train(
     print(f"VRAM: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
     print(f"CUDA: {torch.version.cuda}")
 
-    os.environ.setdefault("KERNELFORGE_EVAL_BACKEND", "local")
+    os.environ.setdefault("KERNELFORGE_EVAL_BACKEND", "modal")
     os.environ.setdefault("KERNELFORGE_MODAL_APP", EVAL_APP_NAME)
     if model_label:
         os.environ["KERNELFORGE_MODEL_LABEL"] = model_label
-    os.environ.setdefault("KERNELFORGE_MODEL_LABEL", "opus_2b")
-    os.environ.setdefault("KERNELFORGE_LORA_R", "16")
-    os.environ.setdefault("KERNELFORGE_LORA_ALPHA", "16")
+    os.environ.setdefault("KERNELFORGE_MODEL_LABEL", "opus_9b")
+    os.environ.setdefault("KERNELFORGE_LORA_R", "64")
+    os.environ.setdefault("KERNELFORGE_LORA_ALPHA", "64")
     # Skip Unsloth patching — Qwen 3.5 RoPE bug in unsloth compiled module.
     os.environ.setdefault("KERNELFORGE_SKIP_UNSLOTH", "1")
+    # INT8 quantization: frees ~9GB VRAM (18GB bf16 → 9GB INT8) for larger batches.
+    # INT8 is well-tested and much better than 4-bit for code generation quality.
+    os.environ.setdefault("KERNELFORGE_QUANT_BITS", "8")
     if stage in {0, 1}:
         os.environ.setdefault("KERNELFORGE_SKIP_BENCHMARK", "1")
         os.environ.setdefault("KERNELFORGE_DEBUG_TIMINGS", "1")
@@ -161,12 +164,10 @@ def train(
         os.environ.setdefault("KERNELFORGE_BATCH_EVAL", "1")
         os.environ.setdefault("KERNELFORGE_STAGE1_MAX_TURNS", "1")
         os.environ.setdefault("CUDA_AGENT_STAGE1_SAMPLES", "100")
-        os.environ.setdefault("KERNELFORGE_STAGE1_MAX_COMPLETION_LENGTH", "1024")
-        os.environ.setdefault("KERNELFORGE_STAGE1_NUM_GENERATIONS", "2")
-        os.environ.setdefault("KERNELFORGE_STAGE1_PER_DEVICE_BATCH_SIZE", "2")
-        os.environ.setdefault("KERNELFORGE_STAGE1_GRADIENT_ACCUMULATION_STEPS", "1")
-        # QLoRA: 4-bit base model for faster inference with 9B+ models
-        os.environ.setdefault("KERNELFORGE_QUANT_BITS", "4")
+        os.environ.setdefault("KERNELFORGE_STAGE1_MAX_COMPLETION_LENGTH", "2048")
+        os.environ.setdefault("KERNELFORGE_STAGE1_NUM_GENERATIONS", "4")
+        os.environ.setdefault("KERNELFORGE_STAGE1_PER_DEVICE_BATCH_SIZE", "1")
+        os.environ.setdefault("KERNELFORGE_STAGE1_GRADIENT_ACCUMULATION_STEPS", "8")
         if max_steps is None:
             os.environ.setdefault("KERNELFORGE_STAGE1_MAX_STEPS", "5")
         print(

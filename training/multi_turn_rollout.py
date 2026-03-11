@@ -45,12 +45,6 @@ ROLLOUT_LOG_PATH = Path(
 
 def extract_cuda_code(text: str) -> str:
     """Extract CUDA code from model output (fenced block or raw __global__)."""
-    # Handle case where text might be a list or dict
-    if isinstance(text, list):
-        text = str(text)
-    elif isinstance(text, dict):
-        text = text.get("content", str(text))
-    
     for marker in ["```cuda", "```cpp", "```c", "```c++"]:
         if marker in text:
             start = text.index(marker) + len(marker)

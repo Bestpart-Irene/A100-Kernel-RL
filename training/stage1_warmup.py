@@ -68,21 +68,6 @@ def _dataset_from_rows(rows: list[dict]) -> Dataset:
     return MiniDataset(rows)
 
 
-CUDA_SYSTEM_PROMPT = (
-    "You are a CUDA kernel engineer. Output ONLY the CUDA C++ code inside a "
-    "```cuda code block. No explanation, no markdown outside the code block, "
-    "no commentary. The code must be a complete, compilable CUDA kernel."
-)
-
-
-def _wrap_prompt_as_chat(prompt_text: str) -> list[dict[str, str]]:
-    """Wrap a raw prompt string as chat messages with system instruction."""
-    return [
-        {"role": "system", "content": CUDA_SYSTEM_PROMPT},
-        {"role": "user", "content": prompt_text},
-    ]
-
-
 def load_stage1_dataset() -> Dataset:
     """Load stage1 prompts from unified dataset loader, with safe fallback."""
 
@@ -94,13 +79,7 @@ def load_stage1_dataset() -> Dataset:
             seed=42,
         )
         if len(ds) > 0:
-            # Wrap string prompts as chat messages for better code-only output
-            rows = ds.to_list() if hasattr(ds, "to_list") else list(ds)
-            for row in rows:
-                if isinstance(row.get("prompt"), str):
-                    row["prompt"] = _wrap_prompt_as_chat(row["prompt"])
-            ds = _dataset_from_rows(rows)
-            print(f"Loaded {len(ds)} unified Stage 1 prompts (chat format)")
+            print(f"Loaded {len(ds)} unified Stage 1 prompts")
             return ds.shuffle(seed=42) if hasattr(ds, "shuffle") else ds
     except Exception as e:
         print(f"Could not load Ops-6K for Stage 1: {e}")
@@ -108,7 +87,7 @@ def load_stage1_dataset() -> Dataset:
     print("Using fallback Stage 1 prompts with live WCC evaluation support")
     return _dataset_from_rows([
         {
-            "prompt": _wrap_prompt_as_chat(
+            "prompt": (
                 f"Write a CUDA Weakly Connected Components kernel for {TARGET_GPU} ({TARGET_ARCH}) "
                 "using union-find with path compression."
             ),
@@ -117,7 +96,7 @@ def load_stage1_dataset() -> Dataset:
             "data_source": "fallback_wcc",
         },
         {
-            "prompt": _wrap_prompt_as_chat(
+            "prompt": (
                 f"Write a CUDA Weakly Connected Components kernel for {TARGET_GPU} ({TARGET_ARCH}) "
                 "optimized for sparse disconnected graphs with early convergence."
             ),
@@ -126,7 +105,7 @@ def load_stage1_dataset() -> Dataset:
             "data_source": "fallback_wcc",
         },
         {
-            "prompt": _wrap_prompt_as_chat(
+            "prompt": (
                 f"Write a CUDA Weakly Connected Components kernel for {TARGET_GPU} ({TARGET_ARCH}) "
                 "using shared memory staging for dense frontiers."
             ),
@@ -151,21 +130,7 @@ def make_cuda_reward_func(task_rows: list[dict]):
 
     prompt_lookup = build_prompt_lookup(task_rows)
 
-    def _to_text(value) -> str:
-        """Extract text from TRL completion/prompt (may be str, list of dicts, or dict)."""
-        if isinstance(value, str):
-            return value
-        if isinstance(value, list):
-            # Chat format: [{"role": "assistant", "content": "..."}, ...]
-            for msg in reversed(value):
-                if isinstance(msg, dict) and msg.get("content"):
-                    return msg["content"]
-            return ""
-        if isinstance(value, dict):
-            return value.get("content", "")
-        return str(value)
-
-    def cuda_eval_reward(completions, prompts=None, **kwargs) -> list[float]:
+    def cuda_eval_reward(completions: list[str], prompts: list[str] | None = None, **kwargs) -> list[float]:
         """Evaluate generated CUDA kernels and return rewards.
 
         Dense reward ladder (richer gradient signal than flat -1.0):
@@ -180,15 +145,12 @@ def make_cuda_reward_func(task_rows: list[dict]):
         stats = {"no_code": 0, "truncated": 0, "short": 0, "eval_ok": 0, "error": 0}
         for i, completion in enumerate(completions):
             try:
-                completion_text = _to_text(completion)
-                if i == 0:  # Log first completion for debugging
-                    print(f"  [reward] completion[0] preview: {completion_text[:300]!r}", flush=True)
-                cuda_code = extract_cuda_code(completion_text)
+                cuda_code = extract_cuda_code(completion)
 
                 # Dense reward for different failure modes
                 if not cuda_code:
                     # Check if truncated (hit max completion length)
-                    if len(completion_text) >= MAX_COMPLETION_LENGTH - 10:
+                    if len(completion) >= MAX_COMPLETION_LENGTH - 10:
                         rewards.append(-0.7)
                         stats["truncated"] += 1
                         print(f"  [reward] sample {i}: truncated reward=-0.70", flush=True)
@@ -205,19 +167,8 @@ def make_cuda_reward_func(task_rows: list[dict]):
                     continue
 
                 # Find the matching task row for this prompt
-                # Handle both string prompts and chat format lists
-                prompt_raw = prompts[i] if prompts else ""
-                prompt_text = _to_text(prompt_raw)  # Extract text from chat format if needed
-                
-                # Try direct prompt key first, then try extracted text
-                task_row = prompt_lookup.get(str(prompt_raw).strip())
-                if task_row is None:
-                    task_row = prompt_lookup.get(prompt_text.strip())
-                if task_row is None:
-                    # Create fallback with minimal metadata
-                    task_row = {"prompt": prompt_text}
-                
-                task_row = normalize_task_row(task_row)
+                prompt = prompts[i] if prompts else ""
+                task_row = normalize_task_row(prompt_lookup.get(prompt, {"prompt": prompt}))
 
                 result = evaluate_code_remote(
                     cuda_code,
