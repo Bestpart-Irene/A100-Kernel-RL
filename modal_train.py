@@ -20,7 +20,7 @@ import modal
 
 os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
 
-TRAIN_GPU = os.getenv("KERNELFORGE_TRAIN_GPU", "A100")
+TRAIN_GPU = os.getenv("KERNELFORGE_TRAIN_GPU", "A100-80GB")
 APP_NAME = os.getenv("KERNELFORGE_TRAIN_APP", "kernelforge-train")
 EVAL_APP_NAME = os.getenv("KERNELFORGE_MODAL_APP", "kernelforge-a100")
 
