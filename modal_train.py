@@ -20,7 +20,7 @@ import modal
 
 os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
 
-TRAIN_GPU = os.getenv("KERNELFORGE_TRAIN_GPU", "A100")
+TRAIN_GPU = os.getenv("KERNELFORGE_TRAIN_GPU", "A100-80GB")
 APP_NAME = os.getenv("KERNELFORGE_TRAIN_APP", "kernelforge-train")
 EVAL_APP_NAME = os.getenv("KERNELFORGE_MODAL_APP", "kernelforge-a100")
 
@@ -33,9 +33,11 @@ train_image = (
     .pip_install("torch==2.9.0", "torchvision==0.24.0")
     # Xformers as attention backend (flash-attn removed — was broken).
     .pip_install("xformers>=0.0.29")
-    # Fast linear attention for Qwen 3.5 Mamba-style layers (replaces pure PyTorch fallback).
-    # Best-effort: no pre-built wheel for CUDA 12.4 + torch 2.9, falls back to PyTorch if missing.
-    .run_commands("pip install causal-conv1d>=1.4.0 || echo 'causal-conv1d build failed, using PyTorch fallback'")
+    # Build tools needed for causal-conv1d CUDA extension (g++ required by torch cpp_extension).
+    .apt_install("g++", "ninja-build")
+    # Fast linear attention for Qwen 3.5 Mamba-style layers — REQUIRED for 9B model.
+    # Without this, the PyTorch fallback hangs during GRPO batched generation (G>1).
+    .pip_install("causal-conv1d>=1.4.0")
     # Unsloth with full deps (caps trl<=0.24.0, datasets<4.4.0).
     .pip_install("unsloth==2026.3.4", "unsloth_zoo")
     # Training stack — transformers 5.2.0 needed for Qwen 3.5 architecture.
@@ -122,15 +124,11 @@ def train(
     print(f"VRAM: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
     print(f"CUDA: {torch.version.cuda}")
 
-    # Local eval for now — verify GRPO training works before switching to modal.
-    os.environ.setdefault("KERNELFORGE_EVAL_BACKEND", "local")
+    os.environ.setdefault("KERNELFORGE_EVAL_BACKEND", "modal")
     os.environ.setdefault("KERNELFORGE_MODAL_APP", EVAL_APP_NAME)
     if model_label:
         os.environ["KERNELFORGE_MODEL_LABEL"] = model_label
-    # Use 2B model by default — 9B Qwen 3.5 Mamba layers hang during GRPO
-    # batched generation without causal-conv1d. Use --model-label opus_9b after
-    # installing causal-conv1d or enabling vLLM.
-    os.environ.setdefault("KERNELFORGE_MODEL_LABEL", "opus_2b")
+    os.environ.setdefault("KERNELFORGE_MODEL_LABEL", "opus_9b")
     os.environ.setdefault("KERNELFORGE_LORA_R", "64")
     os.environ.setdefault("KERNELFORGE_LORA_ALPHA", "64")
     # Skip Unsloth patching — Qwen 3.5 RoPE bug in unsloth compiled module.
