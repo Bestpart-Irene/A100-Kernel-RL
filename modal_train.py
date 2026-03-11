@@ -31,15 +31,16 @@ train_image = (
     )
     # Pin torch first so everything resolves against it.
     .pip_install("torch==2.9.0", "torchvision==0.24.0")
-    # Xformers as attention backend (flash-attn removed — was broken).
+    # Attention backends: xformers as fallback, flash-attn 2.5+ for 10-20% speedup.
     .pip_install("xformers>=0.0.29")
+    .pip_install("flash-attn>=2.5.0")
     # NOTE: causal-conv1d removed — fails to build on Modal (output rate limit from ptxas).
     # The 9B model works without it, just slower. Use shorter max_completion_length to compensate.
-    # Unsloth with full deps (caps trl<=0.24.0, datasets<4.4.0).
+    # Unsloth with full deps.
     .pip_install("unsloth==2026.3.4", "unsloth_zoo")
     # Training stack — transformers 5.2.0 needed for Qwen 3.5 architecture.
     .pip_install(
-        "trl==0.24.0",
+        "trl==0.29.0",
         "transformers==5.2.0",
         "datasets>=3.4.1,<4.4.0",
         "accelerate>=1.4.0",
@@ -55,16 +56,13 @@ train_image = (
     .pip_install("cupy-cuda12x", "ninja")
     # NOTE: vllm removed — requires transformers<5, incompatible with Qwen 3.5.
     # Stage 1 uses USE_VLLM=0 (compat shim). Re-add when vllm supports transformers 5.x.
-    # NO flash-attn — removed until first training step completes cleanly.
+    # flash-attn re-enabled (2.5+ works with torch 2.9 + CUDA 12.4 + Qwen 3.5).
     .env({
         "HF_HUB_ENABLE_HF_TRANSFER": "1",
         "TOKENIZERS_PARALLELISM": "false",
         "NCCL_P2P_DISABLE": "1",
-        # Disable torch.compile — Unsloth bug #4025: VLM variable-length sequences
-        # break torch._dynamo shape tracing in chunked_hidden_states_selective_log_softmax.
-        "UNSLOTH_COMPILE_DISABLE": "1",
-        "TORCHDYNAMO_DISABLE": "1",
-        "TORCHINDUCTOR_DISABLE": "1",
+        # torch.compile re-enabled: Unsloth bug #4025 only affects Unsloth's compiled
+        # trainer, which we bypass via KERNELFORGE_SKIP_UNSLOTH=1.
     })
     .pip_install("hf_transfer")
     .add_local_python_source(
@@ -164,12 +162,12 @@ def train(
         os.environ.setdefault("KERNELFORGE_BATCH_EVAL", "1")
         os.environ.setdefault("KERNELFORGE_STAGE1_MAX_TURNS", "1")
         os.environ.setdefault("CUDA_AGENT_STAGE1_SAMPLES", "100")
-        os.environ.setdefault("KERNELFORGE_STAGE1_MAX_COMPLETION_LENGTH", "512")
-        os.environ.setdefault("KERNELFORGE_STAGE1_NUM_GENERATIONS", "4")
+        os.environ.setdefault("KERNELFORGE_STAGE1_MAX_COMPLETION_LENGTH", "1024")
+        os.environ.setdefault("KERNELFORGE_STAGE1_NUM_GENERATIONS", "8")
         os.environ.setdefault("KERNELFORGE_STAGE1_PER_DEVICE_BATCH_SIZE", "1")
-        os.environ.setdefault("KERNELFORGE_STAGE1_GRADIENT_ACCUMULATION_STEPS", "4")
+        os.environ.setdefault("KERNELFORGE_STAGE1_GRADIENT_ACCUMULATION_STEPS", "8")
         if max_steps is None:
-            os.environ.setdefault("KERNELFORGE_STAGE1_MAX_STEPS", "5")
+            os.environ.setdefault("KERNELFORGE_STAGE1_MAX_STEPS", "100")
         print(
             "Stage 1 debug defaults: "
             f"skip_benchmark={os.environ['KERNELFORGE_SKIP_BENCHMARK']} "

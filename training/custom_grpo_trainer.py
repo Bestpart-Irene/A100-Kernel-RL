@@ -26,8 +26,7 @@ class TRLOOGRPOTrainer(GRPOTrainer):
 
     Drop-in replacement: just swap GRPOTrainer → TRLOOGRPOTrainer.
 
-    Overrides _generate_and_score_completions (not _compute_advantages,
-    which does not exist in TRL 0.24.0). Advantages are computed inline
+    Overrides _generate_and_score_completions. Advantages are computed inline
     inside that method, so we scale them after super() returns.
 
     OVF (Optimal Variance Filtering): After generating G completions per prompt,
@@ -37,7 +36,7 @@ class TRLOOGRPOTrainer(GRPOTrainer):
     """
 
     def __init__(self, *args, **kwargs):
-        # Pop rollout_func if passed — vanilla TRL 0.24.0 doesn't support it.
+        # Pop rollout_func if passed — not used with vanilla TRL GRPOTrainer.
         kwargs.pop("rollout_func", None)
         super().__init__(*args, **kwargs)
         self._trloo_enabled = True

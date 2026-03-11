@@ -328,6 +328,79 @@ Success means:
 6. Prefer local evaluator paths for early debugging.
 7. Prefer text-only causal LM paths for text-only CUDA RL.
 8. Prefer minimal patches over broad rewrites.
+9. Always write a changelog entry for significant changes.
+
+---
+
+## Changelog rules
+
+Every significant change (config updates, bug fixes, architecture changes, reverts) gets a new numbered changelog file in `docs/changelog/`.
+
+### File naming
+
+```
+docs/changelog/NNN_YYYY-MM-DD_kebab-case-title.md
+```
+
+- `NNN` — zero-padded sequence number (001, 002, ...). Increment from the highest existing file.
+- `YYYY-MM-DD` — date of the change.
+- `kebab-case-title` — short descriptive title.
+
+### Required sections
+
+Every changelog entry MUST include these sections:
+
+```markdown
+# NNN — Title
+
+**Date**: YYYY-MM-DD
+**Version**: vX.Y (if applicable)
+**Commit**: `abc1234` (if applicable)
+
+---
+
+## Problem
+What was wrong or missing. Why this change was needed.
+
+## Solution
+What was done. High-level summary of the approach.
+
+## What Changed
+| Action | File/Path | Why |
+|--------|-----------|-----|
+| CREATED/UPDATED/REVERTED/DELETED | `path/to/file` | Reason |
+
+## Thought Process
+Key decisions and their rationale. Why this approach over alternatives.
+
+## Constraints & Trade-offs
+| Constraint | Trade-off Made | Rationale |
+
+## Expected Output
+What should happen after this change is deployed.
+
+## Reality
+_To be filled in after deployment/testing._
+- [ ] Checklist of verification items
+```
+
+### When to write a changelog
+
+- Config changes that affect training behavior
+- Bug fixes
+- Dependency version changes
+- Architecture changes
+- Reverts
+- Audit/review results with action items
+
+Do NOT write changelogs for:
+- Pure documentation/comment updates
+- Whitespace/formatting changes
+- Changes that are immediately reverted in the same session
+
+### Index file
+
+After creating a new changelog, update the index at `docs/CHANGELOG.md` with a new row in the table.
 
 ---
 
